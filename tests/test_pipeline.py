@@ -501,6 +501,71 @@ def test_bitsandbytes_is_not_stacked_on_a_quantised_checkpoint(tmp_path, monkeyp
     assert any("already fp8-quantised" in n for n in manager.take_notices())
 
 
+def _install_fp8_experts(monkeypatch, overrides):
+    """Install a stub transformers.integrations.finegrained_fp8 with FP8Experts."""
+    import types
+
+    class FP8Experts:
+        _impl_tp_layer_overrides = overrides
+
+    root = types.ModuleType("transformers")
+    integrations = types.ModuleType("transformers.integrations")
+    fp8 = types.ModuleType("transformers.integrations.finegrained_fp8")
+    fp8.FP8Experts = FP8Experts
+    integrations.finegrained_fp8 = fp8
+    root.integrations = integrations
+    monkeypatch.setitem(sys.modules, "transformers", root)
+    monkeypatch.setitem(sys.modules, "transformers.integrations", integrations)
+    monkeypatch.setitem(sys.modules, "transformers.integrations.finegrained_fp8", fp8)
+    return FP8Experts
+
+
+def test_fp8_tp_plan_patch_adds_the_missing_default(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    experts = _install_fp8_experts(monkeypatch, {"deepgemm_megamoe": {"a": "b"}})
+    assert manager._patch_fp8_tp_plan() is not None
+    assert experts._impl_tp_layer_overrides[None] == {}
+    # The real key must survive untouched.
+    assert experts._impl_tp_layer_overrides["deepgemm_megamoe"] == {"a": "b"}
+
+
+def test_fp8_tp_plan_patch_is_idempotent(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    _install_fp8_experts(monkeypatch, {"deepgemm_megamoe": {}})
+    assert manager._patch_fp8_tp_plan() is not None
+    assert manager._patch_fp8_tp_plan() is None
+
+
+def test_fp8_tp_plan_patch_is_a_noop_without_transformers(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    monkeypatch.setitem(sys.modules, "transformers", None)
+    assert manager._patch_fp8_tp_plan() is None
+
+
+def test_fp8_tp_plan_patch_fixes_the_upstream_crash(tmp_path, monkeypatch):
+    """Reproduce transformers' update_tp_plan line, before and after the patch.
+
+    This mirrors quantizer_finegrained_fp8.py:195 in transformers 5.16.1:
+
+        layer_overrides = FP8Experts._impl_tp_layer_overrides.get(impl)
+        updated_plan = {k: layer_overrides.get(v, v) for k, v in base_plan.items()}
+    """
+    manager = _manager(tmp_path)
+    experts = _install_fp8_experts(monkeypatch, {"deepgemm_megamoe": {}})
+    base_plan = {"layers.*.self_attn.q_proj.weight": "colwise"}
+    impl = None  # transformers' default for _experts_implementation
+
+    def upstream_line():
+        overrides = experts._impl_tp_layer_overrides.get(impl)
+        return {k: overrides.get(v, v) for k, v in base_plan.items()}
+
+    with pytest.raises(AttributeError, match="'NoneType' object has no attribute 'get'"):
+        upstream_line()
+
+    manager._patch_fp8_tp_plan()
+    assert upstream_line() == base_plan  # unchanged plan, which is the intent
+
+
 @pytest.mark.parametrize(
     "exc,expected",
     [

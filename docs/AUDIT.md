@@ -324,7 +324,7 @@ the offending key path.
 
 ### C15. No tests and no CI
 
-**Fixed:** 88 tests that need neither torch nor a GPU, covering config
+**Fixed:** 92 tests that need neither torch nor a GPU, covering config
 validation, LTX `8n+1` frame alignment and resolution snapping, seed handling,
 log rotation and corruption tolerance, frame normalisation, output pruning and
 the full UI build.
@@ -414,3 +414,49 @@ without either still works), then `AutoModelForCausalLM`.
 > contains no `.py` files at all — only config, tokenizer, chat template and
 > safetensors — so there is no remote code to trust. Enabling it would accept
 > arbitrary-code-execution risk in exchange for nothing.
+
+### E4. The actual blocker: a bug in `transformers` itself
+
+With E1–E3 in place the logs finally named the cause, and it was upstream. All
+three auto classes failed identically, before a single weight was read:
+
+```
+transformers/quantizers/quantizer_finegrained_fp8.py", line 195, in update_tp_plan
+    updated_plan = {k: layer_overrides.get(v, v) for k, v in base_plan.items()}
+AttributeError: 'NoneType' object has no attribute 'get'
+```
+
+Reading `transformers==5.16.1`, `update_tp_plan` is:
+
+```python
+if "Qwen3" in config.__class__.__name__:
+    config.base_model_tp_plan = text_plan          # non-empty, unconditionally
+
+impl = getattr(config, "_experts_implementation", None)
+layer_overrides = FP8Experts._impl_tp_layer_overrides.get(impl)
+for plan_attr in ("base_model_tp_plan", "base_model_ep_plan"):
+    base_plan = getattr(config, plan_attr, None) or {}
+    updated_plan = {k: layer_overrides.get(v, v) for k, v in base_plan.items()}
+```
+
+`FP8Experts._impl_tp_layer_overrides` holds exactly one key,
+`"deepgemm_megamoe"`, while `_experts_implementation` defaults to `None`
+(`configuration_utils.py:333`). So `.get(impl)` returns `None`. The guard the
+line needs — `or {}` — is missing.
+
+The crash is therefore **unconditional** for any fine-grained FP8 checkpoint
+whose config class name contains `Qwen3`: the same function guarantees a
+non-empty `base_plan` two lines earlier, so the comprehension always runs.
+Nothing about this project could have avoided it.
+
+**Worked around:** `_patch_fp8_tp_plan()` registers `None -> {}` in that map
+before the FP8 load. That is precisely the "no overrides" behaviour the code
+intends — the plan is copied unchanged, compares equal, and is left in place.
+It is idempotent, scoped to checkpoints that declare FP8, and becomes a no-op
+once upstream adds the guard.
+
+A test reproduces the upstream line directly: it asserts `AttributeError`
+before the patch and an unchanged plan after, so if `transformers` fixes this
+the workaround's necessity is still documented rather than silently load-bearing.
+
+> Worth reporting upstream — the one-character fix is `.get(impl) or {}`.

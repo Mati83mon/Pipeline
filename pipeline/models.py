@@ -334,6 +334,50 @@ class ModelManager:
         return pipe, extra
 
     @staticmethod
+    def _patch_fp8_tp_plan() -> Optional[str]:
+        """Work around a transformers bug that breaks every fine-grained FP8 Qwen3.
+
+        In transformers 5.16.1, ``quantizer_finegrained_fp8.update_tp_plan``
+        does::
+
+            if "Qwen3" in config.__class__.__name__:
+                config.base_model_tp_plan = text_plan     # non-empty
+
+            impl = getattr(config, "_experts_implementation", None)
+            layer_overrides = FP8Experts._impl_tp_layer_overrides.get(impl)
+            ...
+            updated_plan = {k: layer_overrides.get(v, v) for k, v in base_plan.items()}
+
+        ``_impl_tp_layer_overrides`` holds exactly one key,
+        ``"deepgemm_megamoe"``, while ``_experts_implementation`` defaults to
+        ``None``. So ``.get(impl)`` returns ``None`` and the comprehension
+        raises ``AttributeError: 'NoneType' object has no attribute 'get'``
+        before a single weight is read — and because the same function has just
+        written a non-empty plan for any config class named ``*Qwen3*``, the
+        crash is unconditional for these checkpoints. Upstream is missing an
+        ``or {}``.
+
+        Registering ``None -> {}`` restores the behaviour the code intends for
+        "no overrides": the plan is copied unchanged, compares equal, and is
+        left alone. Idempotent, and a no-op once upstream adds the guard or
+        when the installed version never had the bug.
+        """
+        try:
+            from transformers.integrations.finegrained_fp8 import FP8Experts
+        except Exception as exc:  # noqa: BLE001 - older/newer layouts
+            LOGGER.debug("FP8Experts not importable, no patch needed: %s", exc)
+            return None
+
+        overrides = getattr(FP8Experts, "_impl_tp_layer_overrides", None)
+        if not isinstance(overrides, dict) or overrides.get(None) is not None:
+            return None
+        overrides[None] = {}
+        return (
+            "worked around a transformers bug: FP8Experts._impl_tp_layer_overrides "
+            "had no entry for the default experts implementation"
+        )
+
+    @staticmethod
     def _declared_quantization(
         model_id: str, trust: bool, token: Optional[str]
     ) -> Optional[str]:
@@ -381,6 +425,10 @@ class ModelManager:
                 model_id,
                 declared_quant,
             )
+            if "fp8" in declared_quant.lower():
+                patched = self._patch_fp8_tp_plan()
+                if patched:
+                    LOGGER.info("%s", patched)
         else:
             dtype = resolve_dtype(dtype_name.removeprefix("force:") or "bfloat16")
 
