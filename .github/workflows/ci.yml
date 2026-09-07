@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # Only main on push. Feature branches are covered by `pull_request`, and
+  # listening to both on every branch runs the whole workflow twice per push
+  # once a PR is open — four check runs where two carry the same information.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
