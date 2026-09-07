@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # Match the Space runtime declared in README.md's front matter.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # Deliberately not `-r requirements.txt`: the suite is written to run
+      # without torch, diffusers or transformers, and installing ~2 GB of CUDA
+      # wheels to run tests that never import them would turn a 40-second job
+      # into a five-minute one. The `dependencies` job below covers the pins.
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "gradio==6.26.0" pytest ruff Pillow numpy "imageio[ffmpeg]"
+
+      - name: Lint
+        run: ruff check . --select F,E9
+
+      - name: Test
+        env:
+          GRADIO_ANALYTICS_ENABLED: "False"
+        run: python -m pytest tests/ -q
+
+  dependencies:
+    name: Resolve pinned dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # Catches an unsatisfiable pin set before the Space build hits it — the
+      # class of failure that is slowest to diagnose from Space logs, where it
+      # surfaces minutes in and blames whichever package pip touched last.
+      # --dry-run installs nothing, but it does download wheels it cannot
+      # resolve from metadata alone (torch is ~1 GB), so this job takes a few
+      # minutes. That is why it is separate: a slow resolver check must not
+      # hold up the lint and test signal.
+      - name: Resolve requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install --dry-run --report /dev/null -r requirements.txt

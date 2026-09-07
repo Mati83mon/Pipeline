@@ -1,0 +1,19 @@
+# Text normalisation
+* text=auto eol=lf
+*.sh text eol=lf
+
+# Git LFS for model weights only.
+#
+# The original config also routed *.png / *.jpg / *.mp4 through LFS. That is a
+# trap for this repo: every generated file dropped in outputs/ would be pushed
+# to LFS on the next commit and burn storage quota. Generated media is
+# gitignored instead, and these rules cover weights that may legitimately be
+# committed.
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.ckpt filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.gguf filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text
+*.msgpack filter=lfs diff=lfs merge=lfs -text
