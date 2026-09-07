@@ -149,12 +149,13 @@ matter, that `app_file` exists, that `python_version` and the `torch` pin are
 ones ZeroGPU actually supports, and that every model in `config.json` is
 declared above.
 
-GitHub Actions runs the same lint and suite on every push
-(`.github/workflows/ci.yml`), plus a separate job that resolves
+GitHub Actions runs the same lint and suite on every pull request and every
+push to `main` (`.github/workflows/ci.yml`), plus a separate job that resolves
 `requirements.txt` with `pip --dry-run` to catch an unsatisfiable pin set
-before a Space build does. That second job takes a few minutes — `--dry-run`
-installs nothing but still downloads wheels it cannot resolve from metadata
-alone — which is why it does not gate the fast lint-and-test signal.
+before a Space build does. `--dry-run` installs nothing but still downloads
+wheels it cannot resolve from metadata alone, so that job runs longer and more
+variably than the tests (10–80 s observed) — hence a separate job rather than
+one more step in front of the fast signal.
 
 ## Layout
 
