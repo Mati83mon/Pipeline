@@ -136,7 +136,7 @@ with small token budgets; image and video generation are not practical.
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q          # 78 tests, no torch or GPU required
+python -m pytest tests/ -q          # 92 tests, no torch or GPU required
 ```
 
 They cover config validation, LTX frame/resolution alignment, seed handling,

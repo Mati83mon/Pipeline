@@ -203,14 +203,18 @@ class ModelManager:
                 handle, extra = self._load(module, primary, cfg)
                 self._loaded = LoadedModel(module, primary, handle, False, extra)
             except Exception as primary_exc:  # noqa: BLE001
-                LOGGER.warning("loading %s failed: %s", primary, primary_exc)
+                # Log the traceback, not just the message. A silent fallback
+                # whose only trace is the exception class name is unusable:
+                # it cannot distinguish a gated 401 from an unsupported
+                # architecture, an OOM or a dtype conflict.
+                LOGGER.exception("loading %s failed", primary)
                 if not fallback:
                     raise ModelLoadError(
                         self._explain_load_failure(primary, primary_exc)
                     ) from primary_exc
                 self._notice(
-                    f"{primary} could not be loaded ({type(primary_exc).__name__}); "
-                    f"falling back to {fallback}."
+                    f"{primary} could not be loaded — {self._short_reason(primary_exc)}. "
+                    f"Falling back to {fallback}. Full traceback is in the Space logs."
                 )
                 try:
                     handle, extra = self._load(module, fallback, cfg)
@@ -244,6 +248,18 @@ class ModelManager:
                 + ", ".join(evicted)
                 + ". They will re-download when next used."
             )
+
+    @staticmethod
+    def _short_reason(exc: Exception, limit: int = 240) -> str:
+        """One-line cause for the UI: exception type plus its first line.
+
+        The UI previously showed only the class name, which for a chain of
+        loader attempts is always ``ModelLoadError`` — true and useless.
+        """
+        text = " ".join(str(exc).split())
+        if len(text) > limit:
+            text = text[: limit - 1].rstrip() + "…"
+        return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
     @staticmethod
     def _explain_load_failure(model_id: str, exc: Exception) -> str:
@@ -317,12 +333,104 @@ class ModelManager:
                 LOGGER.warning("image-to-video pipeline unavailable: %s", exc)
         return pipe, extra
 
+    @staticmethod
+    def _patch_fp8_tp_plan() -> Optional[str]:
+        """Work around a transformers bug that breaks every fine-grained FP8 Qwen3.
+
+        In transformers 5.16.1, ``quantizer_finegrained_fp8.update_tp_plan``
+        does::
+
+            if "Qwen3" in config.__class__.__name__:
+                config.base_model_tp_plan = text_plan     # non-empty
+
+            impl = getattr(config, "_experts_implementation", None)
+            layer_overrides = FP8Experts._impl_tp_layer_overrides.get(impl)
+            ...
+            updated_plan = {k: layer_overrides.get(v, v) for k, v in base_plan.items()}
+
+        ``_impl_tp_layer_overrides`` holds exactly one key,
+        ``"deepgemm_megamoe"``, while ``_experts_implementation`` defaults to
+        ``None``. So ``.get(impl)`` returns ``None`` and the comprehension
+        raises ``AttributeError: 'NoneType' object has no attribute 'get'``
+        before a single weight is read — and because the same function has just
+        written a non-empty plan for any config class named ``*Qwen3*``, the
+        crash is unconditional for these checkpoints. Upstream is missing an
+        ``or {}``.
+
+        Registering ``None -> {}`` restores the behaviour the code intends for
+        "no overrides": the plan is copied unchanged, compares equal, and is
+        left alone. Idempotent, and a no-op once upstream adds the guard or
+        when the installed version never had the bug.
+        """
+        try:
+            from transformers.integrations.finegrained_fp8 import FP8Experts
+        except Exception as exc:  # noqa: BLE001 - older/newer layouts
+            LOGGER.debug("FP8Experts not importable, no patch needed: %s", exc)
+            return None
+
+        overrides = getattr(FP8Experts, "_impl_tp_layer_overrides", None)
+        if not isinstance(overrides, dict) or overrides.get(None) is not None:
+            return None
+        overrides[None] = {}
+        return (
+            "worked around a transformers bug: FP8Experts._impl_tp_layer_overrides "
+            "had no entry for the default experts implementation"
+        )
+
+    @staticmethod
+    def _declared_quantization(
+        model_id: str, trust: bool, token: Optional[str]
+    ) -> Optional[str]:
+        """Return the quantisation method a repo declares in its own config.
+
+        Some checkpoints ship pre-quantised weights and describe the scheme in
+        ``config.json`` — the default text model here is block-FP8 with
+        ``weight_block_size: [128, 128]``, built for the vLLM kernel path.
+        Handing such a repo an explicit ``dtype`` overrides the policy the
+        weights were produced under, so the caller needs to know.
+        """
+        try:
+            import transformers
+
+            config = transformers.AutoConfig.from_pretrained(
+                model_id, trust_remote_code=trust, token=token
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.info("could not read the config of %s: %s", model_id, exc)
+            return None
+
+        quant = getattr(config, "quantization_config", None)
+        if not quant:
+            return None
+        if isinstance(quant, dict):
+            return str(quant.get("quant_method") or "quantized")
+        return str(getattr(quant, "quant_method", "quantized"))
+
     def _load_llm(self, model_id: str, cfg: Dict[str, Any]):
         import transformers
 
-        dtype = resolve_dtype(cfg.get("dtype", "bfloat16"))
         trust = bool(cfg.get("trust_remote_code", False))
         token = hf_token()
+
+        # A repo that carries its own quantisation must be loaded on the dtype
+        # policy its config declares. Forcing one on top either errors outright
+        # or silently dequantises tens of GB of weights. `dtype: "force"` in
+        # config.json opts back into the explicit value.
+        dtype_name = str(cfg.get("dtype", "bfloat16"))
+        declared_quant = self._declared_quantization(model_id, trust, token)
+        if declared_quant and not dtype_name.startswith("force"):
+            dtype = None
+            LOGGER.info(
+                "%s declares %s quantisation; leaving dtype to the checkpoint",
+                model_id,
+                declared_quant,
+            )
+            if "fp8" in declared_quant.lower():
+                patched = self._patch_fp8_tp_plan()
+                if patched:
+                    LOGGER.info("%s", patched)
+        else:
+            dtype = resolve_dtype(dtype_name.removeprefix("force:") or "bfloat16")
 
         processor = None
         tokenizer = None
@@ -345,28 +453,53 @@ class ModelManager:
             "token": token,
             "low_cpu_mem_usage": True,
         }
-        quant = self._quantization_config(cfg, dtype)
-        if quant is not None:
-            load_kwargs["quantization_config"] = quant
+        if declared_quant:
+            # Stacking bitsandbytes on top of weights that are already
+            # quantised is not a supported combination.
+            if cfg.get("load_in_4bit") or cfg.get("load_in_8bit"):
+                self._notice(
+                    f"Ignoring load_in_4bit/8bit for {model_id}: the checkpoint "
+                    f"is already {declared_quant}-quantised."
+                )
+        else:
+            quant = self._quantization_config(cfg, dtype)
+            if quant is not None:
+                load_kwargs["quantization_config"] = quant
 
+        # Try the most specific auto class first and fall back. The Hub lists
+        # this model under AutoModelForMultimodalLM while its config declares
+        # Qwen3_5ForConditionalGeneration, so both spellings are attempted
+        # before the text-only class.
         auto_classes = []
-        if processor is not None and hasattr(transformers, "AutoModelForImageTextToText"):
-            auto_classes.append(transformers.AutoModelForImageTextToText)
+        if processor is not None:
+            for name in ("AutoModelForMultimodalLM", "AutoModelForImageTextToText"):
+                auto_cls = getattr(transformers, name, None)
+                if auto_cls is not None:
+                    auto_classes.append(auto_cls)
         auto_classes.append(transformers.AutoModelForCausalLM)
 
         last_exc: Optional[Exception] = None
         model = None
         for auto_cls in auto_classes:
             try:
-                model = _call_with_dtype(
-                    auto_cls.from_pretrained, model_id, dtype=dtype, **load_kwargs
-                )
+                if dtype is None:
+                    model = auto_cls.from_pretrained(model_id, **load_kwargs)
+                else:
+                    model = _call_with_dtype(
+                        auto_cls.from_pretrained, model_id, dtype=dtype, **load_kwargs
+                    )
                 break
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
-                LOGGER.info("%s could not load %s: %s", auto_cls.__name__, model_id, exc)
+                # Full traceback, not just str(exc): when every auto class
+                # fails, the reason is the only thing that distinguishes an
+                # unsupported architecture from a 401, an OOM or a bad dtype.
+                LOGGER.exception("%s could not load %s", auto_cls.__name__, model_id)
         if model is None:
-            raise ModelLoadError(str(last_exc))
+            raise ModelLoadError(
+                f"no transformers auto class could load {model_id} "
+                f"(tried {', '.join(c.__name__ for c in auto_classes)}): {last_exc}"
+            )
 
         model.eval()
         if processor is None and tokenizer is None:  # pragma: no cover - defensive

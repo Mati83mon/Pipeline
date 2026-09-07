@@ -361,6 +361,229 @@ def test_generation_failures_get_actionable_messages(tmp_path, message, expected
     assert expected in manager._explain_generation_failure(RuntimeError(message))
 
 
+def _fake_transformers(quantization_config, record):
+    """A stand-in transformers module that records how the model was loaded."""
+    import types
+
+    module = types.ModuleType("transformers")
+
+    class _Config:
+        pass
+
+    config = _Config()
+    if quantization_config is not None:
+        config.quantization_config = quantization_config
+
+    class AutoConfig:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            return config
+
+    class AutoProcessor:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            return object()
+
+    class _Loader:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            record.append(kwargs)
+
+            class _Model:
+                device = "cpu"
+
+                def eval(self):
+                    return self
+
+            return _Model()
+
+    module.AutoConfig = AutoConfig
+    module.AutoProcessor = AutoProcessor
+    module.AutoModelForImageTextToText = _Loader
+    module.AutoModelForCausalLM = _Loader
+    module.AutoTokenizer = _Loader
+    return module
+
+
+def test_declared_quantization_is_detected(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        _fake_transformers({"quant_method": "fp8", "weight_block_size": [128, 128]}, []),
+    )
+    assert manager._declared_quantization("some/model", False, None) == "fp8"
+
+
+def test_no_declared_quantization_returns_none(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    monkeypatch.setitem(sys.modules, "transformers", _fake_transformers(None, []))
+    assert manager._declared_quantization("some/model", False, None) is None
+
+
+def test_unreadable_config_does_not_raise(tmp_path, monkeypatch):
+    import types
+
+    manager = _manager(tmp_path)
+    module = types.ModuleType("transformers")
+
+    class AutoConfig:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            raise OSError("401 gated")
+
+    module.AutoConfig = AutoConfig
+    monkeypatch.setitem(sys.modules, "transformers", module)
+    assert manager._declared_quantization("some/model", False, None) is None
+
+
+def test_prequantised_checkpoint_is_loaded_without_a_forced_dtype(tmp_path, monkeypatch):
+    """The regression this guards: forcing bfloat16 onto block-FP8 weights."""
+    record: list = []
+    manager = _manager(tmp_path)
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        _fake_transformers({"quant_method": "fp8"}, record),
+    )
+    manager._load_llm("some/model", {"dtype": "bfloat16", "multimodal": True})
+    assert record, "the loader was never called"
+    assert "dtype" not in record[-1]
+    assert "torch_dtype" not in record[-1]
+
+
+def _fake_torch():
+    """Enough of torch for resolve_dtype, so this path needs no real install."""
+    import types
+
+    module = types.ModuleType("torch")
+    module.bfloat16 = "bfloat16"
+    module.float16 = "float16"
+    module.float32 = "float32"
+
+    class _Cuda:
+        @staticmethod
+        def is_available():
+            return False
+
+        @staticmethod
+        def device_count():
+            return 0
+
+        @staticmethod
+        def is_bf16_supported():
+            return False
+
+    module.cuda = _Cuda
+    return module
+
+
+def test_plain_checkpoint_still_gets_an_explicit_dtype(tmp_path, monkeypatch):
+    record: list = []
+    manager = _manager(tmp_path)
+    monkeypatch.setitem(sys.modules, "transformers", _fake_transformers(None, record))
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch())
+    manager._load_llm("some/model", {"dtype": "bfloat16", "multimodal": True})
+    assert record, "the loader was never called"
+    assert "dtype" in record[-1] or "torch_dtype" in record[-1]
+
+
+def test_bitsandbytes_is_not_stacked_on_a_quantised_checkpoint(tmp_path, monkeypatch):
+    record: list = []
+    manager = _manager(tmp_path)
+    monkeypatch.setitem(
+        sys.modules, "transformers", _fake_transformers({"quant_method": "fp8"}, record)
+    )
+    manager._load_llm(
+        "some/model", {"dtype": "bfloat16", "multimodal": True, "load_in_4bit": True}
+    )
+    assert "quantization_config" not in record[-1]
+    assert any("already fp8-quantised" in n for n in manager.take_notices())
+
+
+def _install_fp8_experts(monkeypatch, overrides):
+    """Install a stub transformers.integrations.finegrained_fp8 with FP8Experts."""
+    import types
+
+    class FP8Experts:
+        _impl_tp_layer_overrides = overrides
+
+    root = types.ModuleType("transformers")
+    integrations = types.ModuleType("transformers.integrations")
+    fp8 = types.ModuleType("transformers.integrations.finegrained_fp8")
+    fp8.FP8Experts = FP8Experts
+    integrations.finegrained_fp8 = fp8
+    root.integrations = integrations
+    monkeypatch.setitem(sys.modules, "transformers", root)
+    monkeypatch.setitem(sys.modules, "transformers.integrations", integrations)
+    monkeypatch.setitem(sys.modules, "transformers.integrations.finegrained_fp8", fp8)
+    return FP8Experts
+
+
+def test_fp8_tp_plan_patch_adds_the_missing_default(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    experts = _install_fp8_experts(monkeypatch, {"deepgemm_megamoe": {"a": "b"}})
+    assert manager._patch_fp8_tp_plan() is not None
+    assert experts._impl_tp_layer_overrides[None] == {}
+    # The real key must survive untouched.
+    assert experts._impl_tp_layer_overrides["deepgemm_megamoe"] == {"a": "b"}
+
+
+def test_fp8_tp_plan_patch_is_idempotent(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    _install_fp8_experts(monkeypatch, {"deepgemm_megamoe": {}})
+    assert manager._patch_fp8_tp_plan() is not None
+    assert manager._patch_fp8_tp_plan() is None
+
+
+def test_fp8_tp_plan_patch_is_a_noop_without_transformers(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    monkeypatch.setitem(sys.modules, "transformers", None)
+    assert manager._patch_fp8_tp_plan() is None
+
+
+def test_fp8_tp_plan_patch_fixes_the_upstream_crash(tmp_path, monkeypatch):
+    """Reproduce transformers' update_tp_plan line, before and after the patch.
+
+    This mirrors quantizer_finegrained_fp8.py:195 in transformers 5.16.1:
+
+        layer_overrides = FP8Experts._impl_tp_layer_overrides.get(impl)
+        updated_plan = {k: layer_overrides.get(v, v) for k, v in base_plan.items()}
+    """
+    manager = _manager(tmp_path)
+    experts = _install_fp8_experts(monkeypatch, {"deepgemm_megamoe": {}})
+    base_plan = {"layers.*.self_attn.q_proj.weight": "colwise"}
+    impl = None  # transformers' default for _experts_implementation
+
+    def upstream_line():
+        overrides = experts._impl_tp_layer_overrides.get(impl)
+        return {k: overrides.get(v, v) for k, v in base_plan.items()}
+
+    with pytest.raises(AttributeError, match="'NoneType' object has no attribute 'get'"):
+        upstream_line()
+
+    manager._patch_fp8_tp_plan()
+    assert upstream_line() == base_plan  # unchanged plan, which is the intent
+
+
+@pytest.mark.parametrize(
+    "exc,expected",
+    [
+        (RuntimeError("boom"), "RuntimeError: boom"),
+        (ValueError(""), "ValueError"),
+        (OSError("a\nb  c"), "OSError: a b c"),
+    ],
+)
+def test_short_reason_is_one_informative_line(tmp_path, exc, expected):
+    assert _manager(tmp_path)._short_reason(exc) == expected
+
+
+def test_short_reason_truncates(tmp_path):
+    reason = _manager(tmp_path)._short_reason(RuntimeError("x" * 500))
+    assert len(reason) < 300
+    assert reason.endswith("…")
+
+
 def test_notices_are_drained_once(tmp_path):
     manager = _manager(tmp_path)
     manager._notice("first")

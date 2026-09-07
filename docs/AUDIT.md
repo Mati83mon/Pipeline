@@ -324,7 +324,7 @@ the offending key path.
 
 ### C15. No tests and no CI
 
-**Fixed:** 78 tests that need neither torch nor a GPU, covering config
+**Fixed:** 92 tests that need neither torch nor a GPU, covering config
 validation, LTX `8n+1` frame alignment and resolution snapping, seed handling,
 log rotation and corruption tolerance, frame normalisation, output pruning and
 the full UI build.
@@ -355,3 +355,108 @@ build, in logs that blame the last package pip happened to touch.
 | "Progress bars with ETA" | There was no ETA anywhere, and the per-step callback would not survive ZeroGPU (C10). |
 | "History tracking, last 10 generations" | True until a malformed line broke the tab (C8). |
 | "All `safety_checker` layers are explicitly disabled" | These pipelines have no safety checker to disable (A4). |
+
+---
+
+## E. Found on the running Space (not in the original draft)
+
+These are mine, not the draft's — surfaced once the Space was live on ZeroGPU
+with a valid `HF_TOKEN` and the text model still fell back.
+
+### E1. A forced dtype on a checkpoint that carries its own quantisation
+
+`_load_llm` passed `dtype=resolve_dtype("bfloat16")` unconditionally. But
+`orcarouter/Qwen3.8-27B-Uncensored-FP8` declares its own scheme in
+`config.json`:
+
+```json
+"quantization_config": { ..., "weight_block_size": [128, 128] }
+```
+
+It is an **offline block-FP8 (E4M3)** build, tagged `block-fp8` and `vllm`,
+whose card states it "serves with the identical vLLM kernel path". Handing
+such a repo an explicit dtype overrides the policy its weights were produced
+under.
+
+**Fixed:** `_declared_quantization()` reads the repo's config first; when a
+scheme is declared, dtype is left to the checkpoint and the decision is
+logged. Unquantised repos — including the fallback `Qwen3-VL-8B-Instruct` —
+still get the explicit dtype. `dtype: "force:bfloat16"` opts back in.
+
+A second consequence of the same finding: bitsandbytes `load_in_4bit` is no
+longer stacked on top of already-quantised weights, which is not a supported
+combination. The UI says so rather than failing obscurely.
+
+### E2. A silent fallback with no recoverable cause
+
+The fallback path logged `LOGGER.warning("loading %s failed: %s", ...)` — the
+exception's `str()`, no traceback — and told the user only
+`could not be loaded (ModelLoadError)`. For a chain of loader attempts that
+class name is always `ModelLoadError`: true and useless. A gated 401, an
+unsupported architecture, an OOM and a dtype conflict were indistinguishable,
+so every diagnosis was guesswork.
+
+**Fixed:** `LOGGER.exception` at both levels, so the Space logs carry the full
+traceback; `ModelLoadError` names which auto classes were tried; and
+`_short_reason()` puts the exception type plus its first line into the UI
+notice.
+
+### E3. The Hub's declared auto class was not attempted
+
+The Hub lists this model under `AutoModelForMultimodalLM` while its config
+declares `Qwen3_5ForConditionalGeneration`. Only the latter's auto class was
+tried.
+
+**Fixed:** both are attempted (guarded by `getattr`, so a `transformers`
+without either still works), then `AutoModelForCausalLM`.
+
+> **Not done, deliberately:** `trust_remote_code` stays `false`. The model repo
+> contains no `.py` files at all — only config, tokenizer, chat template and
+> safetensors — so there is no remote code to trust. Enabling it would accept
+> arbitrary-code-execution risk in exchange for nothing.
+
+### E4. The actual blocker: a bug in `transformers` itself
+
+With E1–E3 in place the logs finally named the cause, and it was upstream. All
+three auto classes failed identically, before a single weight was read:
+
+```
+transformers/quantizers/quantizer_finegrained_fp8.py", line 195, in update_tp_plan
+    updated_plan = {k: layer_overrides.get(v, v) for k, v in base_plan.items()}
+AttributeError: 'NoneType' object has no attribute 'get'
+```
+
+Reading `transformers==5.16.1`, `update_tp_plan` is:
+
+```python
+if "Qwen3" in config.__class__.__name__:
+    config.base_model_tp_plan = text_plan          # non-empty, unconditionally
+
+impl = getattr(config, "_experts_implementation", None)
+layer_overrides = FP8Experts._impl_tp_layer_overrides.get(impl)
+for plan_attr in ("base_model_tp_plan", "base_model_ep_plan"):
+    base_plan = getattr(config, plan_attr, None) or {}
+    updated_plan = {k: layer_overrides.get(v, v) for k, v in base_plan.items()}
+```
+
+`FP8Experts._impl_tp_layer_overrides` holds exactly one key,
+`"deepgemm_megamoe"`, while `_experts_implementation` defaults to `None`
+(`configuration_utils.py:333`). So `.get(impl)` returns `None`. The guard the
+line needs — `or {}` — is missing.
+
+The crash is therefore **unconditional** for any fine-grained FP8 checkpoint
+whose config class name contains `Qwen3`: the same function guarantees a
+non-empty `base_plan` two lines earlier, so the comprehension always runs.
+Nothing about this project could have avoided it.
+
+**Worked around:** `_patch_fp8_tp_plan()` registers `None -> {}` in that map
+before the FP8 load. That is precisely the "no overrides" behaviour the code
+intends — the plan is copied unchanged, compares equal, and is left in place.
+It is idempotent, scoped to checkpoints that declare FP8, and becomes a no-op
+once upstream adds the guard.
+
+A test reproduces the upstream line directly: it asserts `AttributeError`
+before the patch and an unchanged plan after, so if `transformers` fixes this
+the workaround's necessity is still documented rather than silently load-bearing.
+
+> Worth reporting upstream — the one-character fix is `.get(impl) or {}`.
