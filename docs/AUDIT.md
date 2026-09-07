@@ -324,7 +324,7 @@ the offending key path.
 
 ### C15. No tests and no CI
 
-**Fixed:** 102 tests that need neither torch nor a GPU, covering config
+**Fixed:** 117 tests that need neither torch nor a GPU, covering config
 validation, LTX `8n+1` frame alignment and resolution snapping, seed handling,
 log rotation and corruption tolerance, frame normalisation, output pruning and
 the full UI build.
@@ -527,3 +527,107 @@ a structural checkpoint/architecture mismatch rather than anything about the
 user's prompt; and each generation failure is logged with `LOGGER.exception`
 tagged with the model id, so the traceback is greppable next to the model that
 produced it.
+
+That change did its job — it is what produced the traceback in E7 — but it was
+not sufficient on its own to fix what the *user* sees. See E8.
+
+### E7. The real generation blocker: `kernels` was never a dependency
+
+With E4 and E5 in place the load is clean: both patches announce themselves,
+no `UNEXPECTED` scales, `llm ready in 90.9s`. Generation still failed, and this
+time the traceback reached the bottom:
+
+```
+modeling_qwen3_5.py:448, in forward
+    mixed_qkv = self.in_proj_qkv(hidden_states)
+integrations/finegrained_fp8.py:338, in forward
+    return fp8_linear(...)
+integrations/finegrained_fp8.py:108, in _load_finegrained_fp8_kernel
+    raise ImportError(f"finegrained-fp8 kernel unavailable: {_MISSING_KERNELS_MESSAGE}")
+ImportError: finegrained-fp8 kernel unavailable: `kernels` is either not
+installed or uses an incompatible version (0.16.0 <= version < 0.17.0)
+```
+
+Not a bug this time — a missing dependency, and one that nothing about the
+project surfaced. **transformers implements no FP8 matmul of its own.** Every
+`FP8Linear.forward` ends in `fp8_linear`, which dispatches to DeepGEMM or to
+the Triton `finegrained-fp8` kernel, and *both* are fetched from the Hub
+through the `kernels` package:
+
+```python
+_HUB_KERNEL_MAPPING = {
+    "finegrained-fp8": {"repo_id": "kernels-community/finegrained-fp8", "version": 4},
+    "deep-gemm":       {"repo_id": "kernels-community/deep-gemm", "version": 2},
+}
+```
+
+`requirements.txt` never listed `kernels`, because nothing in the load path
+needs it: the checkpoint downloads, quantises and reports ready, all 31 GB of
+it, and the gap only opens on the first forward pass — inside the GPU
+allocation, after the quota is spent.
+
+**Fixed:** `kernels>=0.16,<0.17` is now a first-class dependency, with the
+window taken from transformers' own `KERNELS_MIN_VERSION`/`KERNELS_MAX_VERSION`
+rather than restated by hand. Verified before pinning: `kernels` 0.16.1 is the
+newest release inside that window, and the kernel repo's `v4` branch — the one
+`version: 4` resolves to — exports exactly the three symbols transformers looks
+up (`matmul_2d`, `matmul_batched`, `matmul_grouped`); `main` still exports the
+older `w8a8_*` names and would have failed the symbol check. The build is pure
+Triton (`build/torch-cuda/*.py`, no compiled ABI), so it is not tied to a torch
+or CUDA version.
+
+`ModelManager._check_fp8_kernels()` additionally probes for the package at load
+time and raises a UI notice when it is missing, so the next person meets this
+before spending ninety seconds and a GPU slot on it rather than after.
+
+### E8. Only `gr.Error` survives the ZeroGPU process boundary
+
+E6 built a good message. The UI still said `Error: 'GenerationError'`, and the
+log said why:
+
+```
+File "spaces/zero/wrappers.py", line 238, in gradio_handler
+    raise error("ZeroGPU worker error", res.error_cls)
+gradio.exceptions.Error: 'GenerationError'
+```
+
+ZeroGPU runs a `@spaces.GPU` function in a **forked worker process** and ships
+the outcome back over a queue. Reading `spaces` 0.51.0:
+
+```python
+def exception_result(exc: Exception) -> ExceptionResult:
+    gradio_error = None
+    if isinstance(exc, gr.Error):
+        gradio_error = exc
+    return ExceptionResult(traceback=..., error_cls=exc.__class__.__name__,
+                           gradio_error=gradio_error)
+```
+
+and in the parent:
+
+```python
+if res.gradio_error is not None:
+    raise res.gradio_error                                  # message intact
+else:
+    raise error("ZeroGPU worker error", res.error_cls)      # class name only
+```
+
+So the exception object is transported **only when it is a `gr.Error`**.
+Everything else is reduced to `exc.__class__.__name__` — for us, the string
+`GenerationError`, which is precisely what the UI printed. Every message the
+manager composes for a failure inside a GPU task was being thrown away one
+process later, no matter how good it was. This also explains why E6 looked like
+it had not worked: it had, in the worker's log, where the user never looks.
+
+**Fixed:** `_gpu_safe` wraps each GPU task *inside* the allocation and converts
+anything that escapes into a `gr.Error` there, where the message still exists.
+Decorator order matters and is the whole point — `@gpu_task` on the outside,
+`@_gpu_safe` beneath it, so the conversion happens in the worker rather than in
+the parent that never sees the exception. An exception that is already a
+`gr.Error` is re-raised unchanged rather than wrapped twice.
+
+Tested from both ends: that a `GenerationError` raised in a task comes out of
+each of the three real `_gpu_*` functions as a `gr.Error` carrying its message
+(remove the decorator and three tests fail), and that the converted error
+survives a `pickle` round trip — which is the property `spaces` actually relies
+on to move it between processes.

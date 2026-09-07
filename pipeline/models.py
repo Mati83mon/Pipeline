@@ -453,6 +453,41 @@ class ModelManager:
         )
 
     @staticmethod
+    def _check_fp8_kernels() -> Optional[str]:
+        """Report a missing FP8 kernel package before a GPU slot is spent on it.
+
+        transformers implements no FP8 matmul of its own. Every
+        ``FP8Linear.forward`` ends in ``finegrained_fp8_linear``, which loads
+        the ``kernels-community/finegrained-fp8`` Triton kernel through the
+        ``kernels`` package — and raises ``ImportError`` when that package is
+        absent or outside the version window.
+
+        The failure mode this catches is expensive and misleading: the
+        checkpoint loads perfectly, tens of gigabytes of it, and only dies on
+        the *first forward pass* — inside the GPU allocation, after the quota
+        has been spent, with nothing about the load having looked wrong.
+
+        The window belongs to transformers
+        (``KERNELS_MIN_VERSION`` / ``KERNELS_MAX_VERSION``), so this asks
+        transformers rather than restating it here and drifting.
+        """
+        try:
+            from transformers.utils.import_utils import is_kernels_available
+
+            available = is_kernels_available()
+        except Exception as exc:  # noqa: BLE001 - probe only; never fatal
+            LOGGER.debug("could not probe for the kernels package: %s", exc)
+            return None
+
+        if available:
+            return None
+        return (
+            "the `kernels` package is missing or outside the version window "
+            "transformers requires, so FP8 generation will fail on the first "
+            "forward pass. Install `kernels>=0.16,<0.17`."
+        )
+
+    @staticmethod
     def _declared_quantization(
         model_id: str, trust: bool, token: Optional[str]
     ) -> Optional[str]:
@@ -507,6 +542,10 @@ class ModelManager:
                 ):
                     if patched:
                         LOGGER.info("%s", patched)
+                missing_kernels = self._check_fp8_kernels()
+                if missing_kernels:
+                    LOGGER.warning("%s", missing_kernels)
+                    self._notice(missing_kernels)
         else:
             dtype = resolve_dtype(dtype_name.removeprefix("force:") or "bfloat16")
 

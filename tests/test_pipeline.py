@@ -150,6 +150,15 @@ def _pinned_version(package: str) -> str:
     raise AssertionError(f"{package} is not pinned in requirements.txt")
 
 
+def _pinned_range(package: str) -> str:
+    """Return the version specifier for a package pinned as a range, not `==`."""
+    for line in (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines():
+        line = line.split("#")[0].strip()
+        if line.startswith(package) and line[len(package) :].startswith((">", "<", "=", "~")):
+            return line[len(package) :].strip()
+    raise AssertionError(f"{package} is not pinned in requirements.txt")
+
+
 def test_sdk_version_matches_pinned_gradio(front_matter):
     assert front_matter["sdk_version"] == _pinned_version("gradio"), (
         "README sdk_version and the gradio pin in requirements.txt must agree, "
@@ -683,6 +692,69 @@ def test_skip_matching_patch_is_idempotent(tmp_path, monkeypatch):
     assert manager._patch_fp8_module_skip_matching() is None
 
 
+def _install_kernels_probe(monkeypatch, available):
+    """Stub transformers.utils.import_utils.is_kernels_available.
+
+    `available=None` installs no probe at all, standing in for a transformers
+    too old to have one.
+    """
+    import types
+
+    root = types.ModuleType("transformers")
+    utils = types.ModuleType("transformers.utils")
+    import_utils = types.ModuleType("transformers.utils.import_utils")
+    if available is not None:
+        import_utils.is_kernels_available = lambda *a, **k: available
+    utils.import_utils = import_utils
+    root.utils = utils
+    for name, mod in (
+        ("transformers", root),
+        ("transformers.utils", utils),
+        ("transformers.utils.import_utils", import_utils),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+
+
+def test_missing_fp8_kernels_are_reported(tmp_path, monkeypatch):
+    """Without `kernels` the checkpoint loads and dies in the forward pass."""
+    _install_kernels_probe(monkeypatch, available=False)
+    reported = _manager(tmp_path)._check_fp8_kernels()
+    assert reported is not None
+    assert "kernels" in reported
+    assert "0.16" in reported
+
+
+def test_present_fp8_kernels_report_nothing(tmp_path, monkeypatch):
+    _install_kernels_probe(monkeypatch, available=True)
+    assert _manager(tmp_path)._check_fp8_kernels() is None
+
+
+def test_fp8_kernel_probe_is_never_fatal(tmp_path, monkeypatch):
+    """A transformers without the helper must not break loading."""
+    _install_kernels_probe(monkeypatch, available=None)
+    assert _manager(tmp_path)._check_fp8_kernels() is None
+
+
+def test_fp8_load_surfaces_the_kernel_warning_to_the_ui(tmp_path, monkeypatch):
+    """The notice must reach the user before a GPU allocation is spent."""
+    from pipeline.models import ModelManager
+
+    manager = _manager(tmp_path)
+    monkeypatch.setitem(
+        sys.modules, "transformers", _fake_transformers({"quant_method": "fp8"}, [])
+    )
+    monkeypatch.setattr(
+        ModelManager, "_check_fp8_kernels", staticmethod(lambda: "kernels are missing")
+    )
+    manager._load_llm("some/model", {"dtype": "bfloat16", "multimodal": True})
+    assert "kernels are missing" in manager.take_notices()
+
+
+def test_requirements_pin_the_fp8_kernel_package():
+    """transformers routes every FP8 matmul through `kernels`; it is not optional."""
+    assert _pinned_range("kernels") == ">=0.16,<0.17"
+
+
 @pytest.mark.parametrize(
     "exc,expected",
     [
@@ -785,3 +857,107 @@ def test_history_handler_maps_columns(app_module, tmp_path, monkeypatch):
 def test_ui_builds(app_module):
     demo = app_module.build_ui()
     assert demo.blocks
+
+
+# ---------------------------------------------------------------------------
+# The ZeroGPU worker boundary
+#
+# `spaces` ships a failed GPU task back to the parent as
+# `ExceptionResult(traceback, error_cls, gradio_error)` and keeps the exception
+# object itself only when it is a `gr.Error`; anything else is re-raised in the
+# parent from its class name alone. That is how a `GenerationError` carrying a
+# real diagnosis arrived in the UI as `Error: 'GenerationError'`.
+# ---------------------------------------------------------------------------
+
+
+def test_gpu_safe_passes_results_through(app_module):
+    assert app_module._gpu_safe(lambda a, b: (a, b))(1, 2) == (1, 2)
+
+
+def test_gpu_safe_preserves_the_wrapped_name(app_module):
+    def _inner():
+        return None
+
+    assert app_module._gpu_safe(_inner).__name__ == "_inner"
+
+
+def test_gpu_safe_converts_backend_errors_to_gradio_errors(app_module):
+    """The regression: only a gr.Error survives the ZeroGPU worker boundary."""
+    import gradio as gr
+
+    from pipeline.models import GenerationError
+
+    message = "ImportError: finegrained-fp8 kernel unavailable: kernels missing"
+
+    @app_module._gpu_safe
+    def _task():
+        raise GenerationError(message)
+
+    with pytest.raises(gr.Error) as caught:
+        _task()
+    assert message in str(caught.value)
+
+
+def test_gpu_safe_does_not_rewrap_a_gradio_error(app_module):
+    import gradio as gr
+
+    original = gr.Error("already actionable")
+
+    @app_module._gpu_safe
+    def _task():
+        raise original
+
+    with pytest.raises(gr.Error) as caught:
+        _task()
+    assert caught.value is original
+
+
+def test_converted_error_survives_the_process_boundary(app_module):
+    """`spaces` pickles the gr.Error to the parent process — the message must live."""
+    import pickle
+
+    import gradio as gr
+
+    from pipeline.models import GenerationError
+
+    message = "the model failed internally (KeyError: 'router')"
+    error = app_module._fail(GenerationError(message))
+    restored = pickle.loads(pickle.dumps(error))
+    assert isinstance(restored, gr.Error)
+    assert message in str(restored)
+
+
+def test_fail_returns_a_gradio_error_unchanged(app_module):
+    import gradio as gr
+
+    error = gr.Error("Prompt cannot be empty.")
+    assert app_module._fail(error) is error
+
+
+def test_fail_names_the_type_of_an_unexpected_error(app_module):
+    assert "TypeError" in str(app_module._fail(TypeError("bad argument")))
+
+
+@pytest.mark.parametrize(
+    "task,method,arity",
+    [
+        ("_gpu_image", "generate_image", 7),
+        ("_gpu_video", "generate_video", 10),
+        ("_gpu_text", "generate_text", 7),
+    ],
+)
+def test_every_gpu_task_converts_before_the_boundary(
+    app_module, monkeypatch, task, method, arity
+):
+    """Guards the decorator itself: drop `@_gpu_safe` and the message is lost."""
+    import gradio as gr
+
+    from pipeline.models import GenerationError
+
+    def _boom(*args, **kwargs):
+        raise GenerationError("a diagnosis worth keeping")
+
+    monkeypatch.setattr(app_module.MANAGER, method, _boom)
+    with pytest.raises(gr.Error) as caught:
+        getattr(app_module, task)(*[None] * arity)
+    assert "a diagnosis worth keeping" in str(caught.value)

@@ -12,6 +12,16 @@ torchvision==0.26.0
 
 transformers==5.16.1
 diffusers==0.40.0
+
+# Required by the default text model, not optional. transformers implements no
+# FP8 matmul of its own: every `FP8Linear.forward` ends in
+# `finegrained_fp8_linear`, which loads the `kernels-community/finegrained-fp8`
+# Triton kernel through this package. Without it the 27B FP8 checkpoint loads
+# perfectly — 31 GB, ~90s — and then dies on the first forward pass with
+# `ImportError: finegrained-fp8 kernel unavailable`, inside the GPU allocation.
+# The window is transformers' own (KERNELS_MIN_VERSION / KERNELS_MAX_VERSION).
+kernels>=0.16,<0.17
+
 accelerate>=1.10,<2
 safetensors>=0.6,<1
 huggingface_hub>=1.0,<2

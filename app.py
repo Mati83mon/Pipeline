@@ -19,10 +19,10 @@ from pipeline.runtime import (  # isort: skip
     vram_status,
 )
 
+import functools
 import logging
 import os
 import random
-import traceback
 from typing import Any, List, Optional
 
 import gradio as gr
@@ -83,16 +83,55 @@ def _run_info(kind: str, seed: int, duration: float, path: str) -> str:
 
 
 def _fail(exc: Exception) -> "gr.Error":
-    """Turn a backend exception into a user-visible Gradio error."""
-    traceback.print_exc()
+    """Turn a backend exception into a user-visible Gradio error.
+
+    `ModelLoadError` and `GenerationError` are already logged with a full
+    traceback by the manager that raised them, so re-logging here would only
+    duplicate it. Anything else has not been logged at all yet.
+    """
+    if isinstance(exc, gr.Error):
+        return exc
     if isinstance(exc, (ModelLoadError, GenerationError)):
         return gr.Error(str(exc))
+    LOGGER.error("request failed", exc_info=exc)
     return gr.Error(f"{type(exc).__name__}: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# GPU tasks — no Gradio objects cross this boundary
+# GPU tasks — no Gradio *components* cross this boundary, but `gr.Error` must
 # ---------------------------------------------------------------------------
+
+
+def _gpu_safe(fn):
+    """Convert a failure into `gr.Error` *inside* the ZeroGPU worker.
+
+    ZeroGPU forks a worker process and ships the result back over a queue.
+    `spaces.zero.wrappers.exception_result` keeps the exception object itself
+    only when it is a `gr.Error`::
+
+        if isinstance(exc, gr.Error):
+            gradio_error = exc
+        return ExceptionResult(traceback=..., error_cls=exc.__class__.__name__,
+                               gradio_error=gradio_error)
+
+    Everything else arrives in the parent as nothing but a class name, which
+    it re-raises as `error("ZeroGPU worker error", res.error_cls)`. That is how
+    a `GenerationError` carrying `ImportError: finegrained-fp8 kernel
+    unavailable: ...` reached the UI as the useless `Error: 'GenerationError'`.
+
+    The message only exists inside the worker, so that is the only place it can
+    be attached to something that survives the trip. Off ZeroGPU there is no
+    boundary and the wrapper is simply a no-op re-raise.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            raise _fail(exc) from exc
+
+    return wrapper
 
 
 def _image_duration(prompt, negative, steps, guidance, width, height, seed) -> float:
@@ -103,6 +142,7 @@ def _image_duration(prompt, negative, steps, guidance, width, height, seed) -> f
 
 
 @gpu_task(duration=_image_duration)
+@_gpu_safe
 def _gpu_image(prompt, negative, steps, guidance, width, height, seed):
     return MANAGER.generate_image(
         prompt=prompt,
@@ -127,6 +167,7 @@ def _video_duration(
 
 
 @gpu_task(duration=_video_duration)
+@_gpu_safe
 def _gpu_video(prompt, negative, image, width, height, frames, fps, steps, guidance, seed):
     return MANAGER.generate_video(
         prompt=prompt,
@@ -150,6 +191,7 @@ def _text_duration(prompt, image, video, max_tokens, temperature, top_p, seed) -
 
 
 @gpu_task(duration=_text_duration)
+@_gpu_safe
 def _gpu_text(prompt, image, video, max_tokens, temperature, top_p, seed):
     return MANAGER.generate_text(
         prompt=prompt,

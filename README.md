@@ -86,6 +86,14 @@ tab silently falls back to `Qwen/Qwen3-VL-8B-Instruct`.
 The token is read from the environment at load time and passed to every
 `from_pretrained` call. It is never written to the log or the UI.
 
+### 3. Nothing else
+
+`requirements.txt` is complete. One pin is easy to mistake for optional and is
+not: **`kernels`**. `transformers` implements no FP8 matmul itself — every FP8
+layer loads a Triton kernel from the Hub through that package — so without it
+the 27B checkpoint loads perfectly and then fails on the first forward pass,
+inside the GPU allocation. The Text tab warns at load time if it is missing.
+
 ## Configuration
 
 Everything tunable lives in `config.json`, validated at startup — a typo raises
@@ -136,7 +144,7 @@ with small token budgets; image and video generation are not practical.
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q          # 102 tests, no torch or GPU required
+python -m pytest tests/ -q          # 117 tests, no torch or GPU required
 ```
 
 They cover config validation, LTX frame/resolution alignment, seed handling,
@@ -180,6 +188,7 @@ docs/DEPLOY.md          Deployment and troubleshooting
 | Symptom | Cause and fix |
 |---|---|
 | Text tab says `(fallback)` | The gated 27B model is unreachable. Accept its licence and set `HF_TOKEN`. |
+| `finegrained-fp8 kernel unavailable` | The `kernels` package is missing or out of range. It is a hard requirement of the FP8 text model, not an extra — reinstall from `requirements.txt`. |
 | `No space left on device` | Disk guard could not free enough. Disable a module in `config.json` or raise `disk_headroom_gb`. |
 | "GPU allocation expired" | The render needed more than the requested duration. Cut steps or frames, or raise `gpu_seconds_*`. |
 | Black or empty image | Almost always `fp16` on a T5 encoder. Set `dtype` back to `bfloat16`. |
