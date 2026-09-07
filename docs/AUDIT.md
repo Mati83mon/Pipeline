@@ -324,7 +324,7 @@ the offending key path.
 
 ### C15. No tests and no CI
 
-**Fixed:** 78 tests that need neither torch nor a GPU, covering config
+**Fixed:** 88 tests that need neither torch nor a GPU, covering config
 validation, LTX `8n+1` frame alignment and resolution snapping, seed handling,
 log rotation and corruption tolerance, frame normalisation, output pruning and
 the full UI build.
@@ -355,3 +355,62 @@ build, in logs that blame the last package pip happened to touch.
 | "Progress bars with ETA" | There was no ETA anywhere, and the per-step callback would not survive ZeroGPU (C10). |
 | "History tracking, last 10 generations" | True until a malformed line broke the tab (C8). |
 | "All `safety_checker` layers are explicitly disabled" | These pipelines have no safety checker to disable (A4). |
+
+---
+
+## E. Found on the running Space (not in the original draft)
+
+These are mine, not the draft's — surfaced once the Space was live on ZeroGPU
+with a valid `HF_TOKEN` and the text model still fell back.
+
+### E1. A forced dtype on a checkpoint that carries its own quantisation
+
+`_load_llm` passed `dtype=resolve_dtype("bfloat16")` unconditionally. But
+`orcarouter/Qwen3.8-27B-Uncensored-FP8` declares its own scheme in
+`config.json`:
+
+```json
+"quantization_config": { ..., "weight_block_size": [128, 128] }
+```
+
+It is an **offline block-FP8 (E4M3)** build, tagged `block-fp8` and `vllm`,
+whose card states it "serves with the identical vLLM kernel path". Handing
+such a repo an explicit dtype overrides the policy its weights were produced
+under.
+
+**Fixed:** `_declared_quantization()` reads the repo's config first; when a
+scheme is declared, dtype is left to the checkpoint and the decision is
+logged. Unquantised repos — including the fallback `Qwen3-VL-8B-Instruct` —
+still get the explicit dtype. `dtype: "force:bfloat16"` opts back in.
+
+A second consequence of the same finding: bitsandbytes `load_in_4bit` is no
+longer stacked on top of already-quantised weights, which is not a supported
+combination. The UI says so rather than failing obscurely.
+
+### E2. A silent fallback with no recoverable cause
+
+The fallback path logged `LOGGER.warning("loading %s failed: %s", ...)` — the
+exception's `str()`, no traceback — and told the user only
+`could not be loaded (ModelLoadError)`. For a chain of loader attempts that
+class name is always `ModelLoadError`: true and useless. A gated 401, an
+unsupported architecture, an OOM and a dtype conflict were indistinguishable,
+so every diagnosis was guesswork.
+
+**Fixed:** `LOGGER.exception` at both levels, so the Space logs carry the full
+traceback; `ModelLoadError` names which auto classes were tried; and
+`_short_reason()` puts the exception type plus its first line into the UI
+notice.
+
+### E3. The Hub's declared auto class was not attempted
+
+The Hub lists this model under `AutoModelForMultimodalLM` while its config
+declares `Qwen3_5ForConditionalGeneration`. Only the latter's auto class was
+tried.
+
+**Fixed:** both are attempted (guarded by `getattr`, so a `transformers`
+without either still works), then `AutoModelForCausalLM`.
+
+> **Not done, deliberately:** `trust_remote_code` stays `false`. The model repo
+> contains no `.py` files at all — only config, tokenizer, chat template and
+> safetensors — so there is no remote code to trust. Enabling it would accept
+> arbitrary-code-execution risk in exchange for nothing.
