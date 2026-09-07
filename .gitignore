@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Model weights and Hub cache — never commit these to a Space repo.
+model_cache/
+hf-cache/
+.cache/
+*.safetensors
+*.gguf
+*.ckpt
+*.pt
+*.pth
+*.bin
+
+# Generated media and run log
+outputs/
+generation_log.jsonl
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store

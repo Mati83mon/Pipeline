@@ -1,0 +1,38 @@
+# AI Media Pipeline — dependencies.
+#
+# Hard pins for anything whose version the Space build depends on:
+#   * torch 2.11.0 is the newest release on ZeroGPU's supported list
+#     (2.8.0 / 2.9.1 / 2.10.0 / 2.11.0); torchvision 0.26.0 is its matching
+#     build, and bumping one without the other breaks the pair.
+#   * gradio must match `sdk_version` in README.md.
+# Compatible ranges for leaf libraries so pip can resolve around the pins.
+
+torch==2.11.0
+torchvision==0.26.0
+
+transformers==5.16.1
+diffusers==0.40.0
+accelerate>=1.10,<2
+safetensors>=0.6,<1
+huggingface_hub>=1.0,<2
+
+# ZeroGPU runtime. Preinstalled on ZeroGPU hardware, a harmless no-op
+# elsewhere, so this same file works in Docker and on a local box.
+spaces>=0.51,<1
+
+gradio==6.26.0
+
+# Chroma and LTX both use a sentencepiece-backed T5 tokenizer, which fails to
+# load without these two. The original requirements omitted them.
+sentencepiece>=0.2,<1
+protobuf>=4,<8
+
+Pillow>=11,<13
+numpy>=1.26,<3
+imageio[ffmpeg]>=2.34,<3
+# Headless build: the plain opencv-python wheel links X11 libraries that a
+# Space container does not ship.
+opencv-python-headless>=4.10,<5
+
+# Only used when config.json enables load_in_4bit / load_in_8bit.
+bitsandbytes>=0.45
