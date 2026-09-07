@@ -78,6 +78,104 @@ def test_missing_file_is_reported(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Space metadata
+#
+# The original draft shipped a README with no YAML front matter at all, so the
+# Space had no `sdk` / `app_file` and could never build (docs/AUDIT.md, A1).
+# These tests make that class of mistake — and a drifting sdk_version — a test
+# failure rather than a deployment failure.
+# ---------------------------------------------------------------------------
+
+
+def _front_matter(text: str) -> dict:
+    """Parse the top-level keys of a Space README's YAML front matter.
+
+    Deliberately dependency-free: it only needs `key: value` and simple
+    `- item` lists, which is all a Space card uses.
+    """
+    if not text.startswith("---"):
+        raise AssertionError("README.md must open with a YAML front matter block")
+    _, _, rest = text.partition("---\n")
+    block, sep, _ = rest.partition("\n---")
+    if not sep:
+        raise AssertionError("README.md front matter is not terminated by '---'")
+
+    parsed: dict = {}
+    current_list_key = None
+    for line in block.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- ") and current_list_key:
+            parsed[current_list_key].append(stripped[2:].strip())
+            continue
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if value:
+            parsed[key] = value
+            current_list_key = None
+        else:
+            parsed[key] = []
+            current_list_key = key
+    return parsed
+
+
+@pytest.fixture(scope="module")
+def front_matter() -> dict:
+    return _front_matter((REPO_ROOT / "README.md").read_text(encoding="utf-8"))
+
+
+def test_space_front_matter_has_required_keys(front_matter):
+    for key in ("title", "sdk", "sdk_version", "app_file", "python_version"):
+        assert key in front_matter, f"README front matter is missing '{key}'"
+    assert front_matter["sdk"] == "gradio"
+
+
+def test_app_file_exists(front_matter):
+    assert (REPO_ROOT / front_matter["app_file"]).is_file()
+
+
+def test_python_version_is_supported_by_zerogpu(front_matter):
+    # ZeroGPU only offers these two interpreters.
+    assert front_matter["python_version"] in {"3.10.13", "3.12.12"}
+
+
+def _pinned_version(package: str) -> str:
+    for line in (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines():
+        line = line.split("#")[0].strip()
+        if line.startswith(f"{package}=="):
+            return line.split("==", 1)[1].strip()
+    raise AssertionError(f"{package} is not pinned in requirements.txt")
+
+
+def test_sdk_version_matches_pinned_gradio(front_matter):
+    assert front_matter["sdk_version"] == _pinned_version("gradio"), (
+        "README sdk_version and the gradio pin in requirements.txt must agree, "
+        "or the Space builds one Gradio and installs another"
+    )
+
+
+def test_torch_pin_is_supported_by_zerogpu():
+    assert _pinned_version("torch") in {"2.8.0", "2.9.1", "2.10.0", "2.11.0"}
+
+
+def test_declared_models_cover_the_configured_ones(front_matter):
+    declared = set(front_matter.get("models", []))
+    config = load_config(REPO_ROOT / "config.json")
+    for section in ("image", "video", "llm"):
+        block = config.section(section)
+        assert block["model_id"] in declared, (
+            f"{block['model_id']} is used by the app but not listed in the "
+            f"README front matter"
+        )
+        fallback = block.get("fallback_model_id")
+        if fallback:
+            assert fallback in declared
+
+
+# ---------------------------------------------------------------------------
 # Parameter alignment
 # ---------------------------------------------------------------------------
 

@@ -136,11 +136,25 @@ with small token budgets; image and video generation are not practical.
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q          # 72 tests, no torch or GPU required
+python -m pytest tests/ -q          # 78 tests, no torch or GPU required
 ```
 
 They cover config validation, LTX frame/resolution alignment, seed handling,
 log rotation, frame normalisation and the full UI build.
+
+Some of them guard this file. `sdk_version` here and the `gradio` pin in
+`requirements.txt` must agree — otherwise the Space builds one Gradio and
+installs another — so a test asserts it, along with the presence of the front
+matter, that `app_file` exists, that `python_version` and the `torch` pin are
+ones ZeroGPU actually supports, and that every model in `config.json` is
+declared above.
+
+GitHub Actions runs the same lint and suite on every push
+(`.github/workflows/ci.yml`), plus a separate job that resolves
+`requirements.txt` with `pip --dry-run` to catch an unsatisfiable pin set
+before a Space build does. That second job takes a few minutes — `--dry-run`
+installs nothing but still downloads wheels it cannot resolve from metadata
+alone — which is why it does not gate the fast lint-and-test signal.
 
 ## Layout
 
@@ -155,6 +169,7 @@ pipeline/
 ├── media.py            Video encode/decode, output pruning
 └── history.py          Bounded JSONL run log
 tests/test_pipeline.py  Test suite
+.github/workflows/      Lint, tests and dependency resolution on every push
 docs/AUDIT.md           Every defect fixed relative to the first draft
 docs/DEPLOY.md          Deployment and troubleshooting
 ```

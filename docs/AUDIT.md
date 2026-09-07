@@ -322,12 +322,25 @@ raised deep inside a handler, minutes into a session.
 **Fixed:** `pipeline/config.py` validates the schema once at startup and reports
 the offending key path.
 
-### C15. No tests
+### C15. No tests and no CI
 
-**Fixed:** 72 tests that need neither torch nor a GPU, covering config
+**Fixed:** 78 tests that need neither torch nor a GPU, covering config
 validation, LTX `8n+1` frame alignment and resolution snapping, seed handling,
 log rotation and corruption tolerance, frame normalisation, output pruning and
 the full UI build.
+
+Several of them close the loop on findings above rather than testing new code:
+A1 (front matter present, `app_file` resolves), the `sdk_version` ↔ `gradio`
+pin agreement, `python_version` and the `torch` pin being values ZeroGPU
+actually supports, and every `config.json` model appearing in the README's
+`models:` list. Each was verified to fail when the corresponding value is
+broken — a test that cannot fail is not a test.
+
+`.github/workflows/ci.yml` runs the lint and suite on every push, plus a
+second job that resolves `requirements.txt` with `pip --dry-run`. The
+resolution job is the cheap version of the slowest failure mode this project
+has: an unsatisfiable pin set that only surfaces several minutes into a Space
+build, in logs that blame the last package pip happened to touch.
 
 ---
 
