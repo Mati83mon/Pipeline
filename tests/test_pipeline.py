@@ -361,6 +361,31 @@ def test_generation_failures_get_actionable_messages(tmp_path, message, expected
     assert expected in manager._explain_generation_failure(RuntimeError(message))
 
 
+def test_generation_failure_always_names_the_exception_type(tmp_path):
+    """A bare KeyError renders as "'key'" — quoted, typeless and unactionable.
+
+    That is exactly what reached the UI as `Error: 'GenerationError'`.
+    """
+    manager = _manager(tmp_path)
+    for exc in (RuntimeError("boom"), KeyError("some_key"), ValueError("bad")):
+        assert type(exc).__name__ in manager._explain_generation_failure(exc)
+
+
+@pytest.mark.parametrize("exc", [KeyError("k"), AttributeError("a"), IndexError("i")])
+def test_structural_failures_point_at_the_checkpoint_not_the_prompt(tmp_path, exc):
+    explained = _manager(tmp_path)._explain_generation_failure(exc)
+    assert "checkpoint" in explained
+    assert "Space logs" in explained
+
+
+def test_oom_message_still_carries_the_exception_type(tmp_path):
+    explained = _manager(tmp_path)._explain_generation_failure(
+        RuntimeError("CUDA out of memory")
+    )
+    assert "Lower the resolution" in explained
+    assert "RuntimeError" in explained
+
+
 def _fake_transformers(quantization_config, record):
     """A stand-in transformers module that records how the model was loaded."""
     import types
@@ -564,6 +589,98 @@ def test_fp8_tp_plan_patch_fixes_the_upstream_crash(tmp_path, monkeypatch):
 
     manager._patch_fp8_tp_plan()
     assert upstream_line() == base_plan  # unchanged plan, which is the intent
+
+
+def _install_quantizer_utils(monkeypatch, buggy: bool):
+    """Stub transformers.quantizers.quantizers_utils + integrations.finegrained_fp8."""
+    import re
+    import types
+
+    def upstream_buggy(full_name, patterns=None):
+        if patterns is None:
+            return True
+        return not any(
+            re.match(f"{k}\\.", full_name)
+            or re.match(f"{k}", full_name)  # the missing end anchor
+            or full_name.endswith(k)
+            for k in patterns
+        )
+
+    def upstream_fixed(full_name, patterns=None):
+        if patterns is None:
+            return True
+        return not any(
+            re.match(f"{k}\\.", full_name) or re.fullmatch(k, full_name) for k in patterns
+        )
+
+    fn = upstream_buggy if buggy else upstream_fixed
+
+    root = types.ModuleType("transformers")
+    quantizers = types.ModuleType("transformers.quantizers")
+    utils = types.ModuleType("transformers.quantizers.quantizers_utils")
+    integrations = types.ModuleType("transformers.integrations")
+    fp8 = types.ModuleType("transformers.integrations.finegrained_fp8")
+    utils.should_convert_module = fn
+    fp8.should_convert_module = fn  # imported by value, as upstream does
+    quantizers.quantizers_utils = utils
+    integrations.finegrained_fp8 = fp8
+    root.quantizers = quantizers
+    root.integrations = integrations
+    for name, mod in (
+        ("transformers", root),
+        ("transformers.quantizers", quantizers),
+        ("transformers.quantizers.quantizers_utils", utils),
+        ("transformers.integrations", integrations),
+        ("transformers.integrations.finegrained_fp8", fp8),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+    return utils, fp8
+
+
+GATE = "model.layers.0.mlp.gate"
+
+
+def test_skip_matching_patch_fixes_gate_proj(tmp_path, monkeypatch):
+    """gate_proj must be quantised even though gate is on the skip list."""
+    manager = _manager(tmp_path)
+    utils, fp8 = _install_quantizer_utils(monkeypatch, buggy=True)
+
+    assert utils.should_convert_module(f"{GATE}_proj", [GATE]) is False  # the bug
+    assert manager._patch_fp8_module_skip_matching() is not None
+    assert utils.should_convert_module(f"{GATE}_proj", [GATE]) is True
+
+
+def test_skip_matching_patch_preserves_intended_skips(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    utils, _ = _install_quantizer_utils(monkeypatch, buggy=True)
+    manager._patch_fp8_module_skip_matching()
+
+    assert utils.should_convert_module(GATE, [GATE]) is False           # router
+    assert utils.should_convert_module("lm_head", ["lm_head"]) is False  # head
+    assert utils.should_convert_module(f"{GATE}.weight", [GATE]) is False
+    assert utils.should_convert_module("model.layers.0.mlp.up_proj", [GATE]) is True
+    assert utils.should_convert_module("anything", None) is True
+
+
+def test_skip_matching_patch_also_fixes_the_by_value_import(tmp_path, monkeypatch):
+    """finegrained_fp8 imports the function by value, so it needs patching too."""
+    manager = _manager(tmp_path)
+    _, fp8 = _install_quantizer_utils(monkeypatch, buggy=True)
+    manager._patch_fp8_module_skip_matching()
+    assert fp8.should_convert_module(f"{GATE}_proj", [GATE]) is True
+
+
+def test_skip_matching_patch_is_skipped_when_upstream_is_correct(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    _install_quantizer_utils(monkeypatch, buggy=False)
+    assert manager._patch_fp8_module_skip_matching() is None
+
+
+def test_skip_matching_patch_is_idempotent(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    _install_quantizer_utils(monkeypatch, buggy=True)
+    assert manager._patch_fp8_module_skip_matching() is not None
+    assert manager._patch_fp8_module_skip_matching() is None
 
 
 @pytest.mark.parametrize(

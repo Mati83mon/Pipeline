@@ -324,7 +324,7 @@ the offending key path.
 
 ### C15. No tests and no CI
 
-**Fixed:** 92 tests that need neither torch nor a GPU, covering config
+**Fixed:** 102 tests that need neither torch nor a GPU, covering config
 validation, LTX `8n+1` frame alignment and resolution snapping, seed handling,
 log rotation and corruption tolerance, frame normalisation, output pruning and
 the full UI build.
@@ -460,3 +460,70 @@ before the patch and an unchanged plan after, so if `transformers` fixes this
 the workaround's necessity is still documented rather than silently load-bearing.
 
 > Worth reporting upstream — the one-character fix is `.get(impl) or {}`.
+
+### E5. A second transformers bug: unanchored module-skip matching
+
+With E4 in place the model **loaded** — `llm ready in 87.7s`, no fallback, 30.9 GB
+of weights resident. Generation then failed, and the load report said why:
+
+```
+Qwen3_5ForConditionalGeneration LOAD REPORT
+model.language_model.layers.{0...63}.mlp.gate_proj.weight_scale_inv | UNEXPECTED
+```
+
+Every FP8 scale for `gate_proj`, in all 64 layers, was rejected as unexpected —
+the module had no parameter to receive it. `quantizers_utils.should_convert_module`
+decides what stays full precision:
+
+```python
+should_not_convert = any(
+    re.match(f"{key}\\.", full_name)
+    or re.match(f"{key}", full_name)      # anchors the start only
+    or full_name.endswith(key)
+    for key in patterns
+)
+```
+
+`re.match` does not anchor the end, so a pattern also matches any longer name
+that merely starts with it. This checkpoint lists `...mlp.gate` — the MoE
+router — as not-to-be-quantised, and that pattern therefore also swallows
+`...mlp.gate_proj`. It was left a plain `nn.Linear` holding FP8 weights with
+nowhere to put their scales, which is precisely a model that loads and then
+dies in the forward pass.
+
+**Worked around:** `_patch_fp8_module_skip_matching()` replaces the middle
+clause with `re.fullmatch`, which is what the function's own docstring
+describes ("the pattern matches full_name exactly or via regex"). Verified
+against real module names:
+
+| module | upstream | anchored |
+|---|---|---|
+| `...mlp.gate_proj` | skipped (bug) | **converted** |
+| `...mlp.up_proj` | converted | converted |
+| `...mlp.gate` (router) | skipped | skipped |
+| `lm_head` | skipped | skipped |
+
+The patch probes the installed version first and does nothing when it already
+classifies `gate_proj` correctly, so it vanishes on a fixed transformers. It
+also reassigns the name inside `integrations.finegrained_fp8`, which imports
+the function by value at module scope — patching only the source module would
+have been a silent no-op. Scope stops there; the other quantiser integrations
+are left untouched.
+
+> Also worth reporting upstream: `re.match(key, name)` should be
+> `re.fullmatch(key, name)`.
+
+### E6. `GenerationError` reached the UI with no type and no message
+
+The Text tab showed `Error: 'GenerationError'` — quoted, which is the giveaway:
+`str(KeyError("x"))` renders as `"'x'"`. `_explain_generation_failure` returned
+a bare `str(exc)`, so for the exception classes that actually surface from a
+model's forward pass the type was dropped and the text became unreadable. The
+same defect as E2, in the path E2 did not cover.
+
+**Fixed:** every generation failure goes through `_short_reason` (type plus
+first line); `KeyError`/`AttributeError`/`IndexError` are additionally named as
+a structural checkpoint/architecture mismatch rather than anything about the
+user's prompt; and each generation failure is logged with `LOGGER.exception`
+tagged with the model id, so the traceback is greppable next to the model that
+produced it.

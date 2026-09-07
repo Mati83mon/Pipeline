@@ -378,6 +378,81 @@ class ModelManager:
         )
 
     @staticmethod
+    def _patch_fp8_module_skip_matching() -> Optional[str]:
+        """Anchor the "do not quantise" name matching in transformers.
+
+        ``quantizers_utils.should_convert_module`` decides which modules keep
+        full precision::
+
+            should_not_convert = any(
+                re.match(f"{key}\\\\.", full_name)
+                or re.match(f"{key}", full_name)          # <- no end anchor
+                or full_name.endswith(key)
+                for key in patterns
+            )
+
+        ``re.match`` anchors the start only, so a pattern is also matched by
+        any longer name that merely *starts* with it. This checkpoint lists
+        ``...mlp.gate`` (the MoE router) as not-to-be-quantised, and that
+        pattern therefore also swallows ``...mlp.gate_proj``.
+
+        The observable symptom is in the load report: every
+        ``layers.{0..63}.mlp.gate_proj.weight_scale_inv`` comes back
+        ``UNEXPECTED``, because ``gate_proj`` was left as a plain ``nn.Linear``
+        with no scale parameter to receive them — while its weights are FP8.
+        The model loads and then fails in the forward pass.
+
+        Replacing the middle clause with ``re.fullmatch`` matches the
+        behaviour the function's own docstring describes ("the pattern matches
+        full_name exactly or via regex"). Verified against real names: it
+        starts converting ``mlp.gate_proj`` while still skipping ``mlp.gate``,
+        ``lm_head``, and still converting ``mlp.up_proj``.
+
+        The patch is applied only after probing that the installed version
+        actually mis-classifies the case, so it disappears on a fixed
+        transformers. Scope is deliberately narrow: the FP8 integration module
+        that imported the function by value, plus its source module.
+        """
+        import re
+
+        try:
+            from transformers.integrations import finegrained_fp8
+            from transformers.quantizers import quantizers_utils
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("quantiser utils not importable, no patch needed: %s", exc)
+            return None
+
+        current = getattr(quantizers_utils, "should_convert_module", None)
+        if current is None or getattr(current, "_pipeline_anchored", False):
+            return None
+
+        # Probe: does this version wrongly skip `gate_proj` given `gate`?
+        probe_patterns = ["model.layers.0.mlp.gate"]
+        if current("model.layers.0.mlp.gate_proj", probe_patterns):
+            return None  # already correct — leave it alone
+
+        def should_convert_module(full_name, patterns=None):  # noqa: ANN001
+            if patterns is None:
+                return True
+            should_not_convert = any(
+                re.match(f"{key}\\.", full_name)
+                or re.fullmatch(key, full_name)
+                or full_name.endswith(f".{key}")
+                or full_name == key
+                for key in patterns
+            )
+            return not should_not_convert
+
+        should_convert_module._pipeline_anchored = True
+        quantizers_utils.should_convert_module = should_convert_module
+        if getattr(finegrained_fp8, "should_convert_module", None) is current:
+            finegrained_fp8.should_convert_module = should_convert_module
+        return (
+            "worked around a transformers bug: unanchored module-skip matching "
+            "excluded gate_proj because the checkpoint skips gate"
+        )
+
+    @staticmethod
     def _declared_quantization(
         model_id: str, trust: bool, token: Optional[str]
     ) -> Optional[str]:
@@ -426,9 +501,12 @@ class ModelManager:
                 declared_quant,
             )
             if "fp8" in declared_quant.lower():
-                patched = self._patch_fp8_tp_plan()
-                if patched:
-                    LOGGER.info("%s", patched)
+                for patched in (
+                    self._patch_fp8_tp_plan(),
+                    self._patch_fp8_module_skip_matching(),
+                ):
+                    if patched:
+                        LOGGER.info("%s", patched)
         else:
             dtype = resolve_dtype(dtype_name.removeprefix("force:") or "bfloat16")
 
@@ -589,6 +667,10 @@ class ModelManager:
                 callback_on_step_end=progress_callback,
             )
         except Exception as exc:  # noqa: BLE001
+            # Tag the traceback with this logger so it is greppable in the
+            # Space logs next to the model that produced it; the bare frames
+            # Gradio prints do not say which model was loaded.
+            LOGGER.exception("generation failed on %s", loaded.model_id)
             self._release_device(loaded)
             raise GenerationError(self._explain_generation_failure(exc)) from exc
         duration = time.time() - started
@@ -666,6 +748,10 @@ class ModelManager:
         try:
             result = pipe(**call_kwargs)
         except Exception as exc:  # noqa: BLE001
+            # Tag the traceback with this logger so it is greppable in the
+            # Space logs next to the model that produced it; the bare frames
+            # Gradio prints do not say which model was loaded.
+            LOGGER.exception("generation failed on %s", loaded.model_id)
             self._release_device(loaded)
             raise GenerationError(self._explain_generation_failure(exc)) from exc
         duration = time.time() - started
@@ -750,6 +836,10 @@ class ModelManager:
             with torch.inference_mode():
                 outputs = model.generate(**inputs, **gen_kwargs)
         except Exception as exc:  # noqa: BLE001
+            # Tag the traceback with this logger so it is greppable in the
+            # Space logs next to the model that produced it; the bare frames
+            # Gradio prints do not say which model was loaded.
+            LOGGER.exception("generation failed on %s", loaded.model_id)
             self._release_device(loaded)
             raise GenerationError(self._explain_generation_failure(exc)) from exc
         duration = time.time() - started
@@ -846,19 +936,33 @@ class ModelManager:
 
     @staticmethod
     def _explain_generation_failure(exc: Exception) -> str:
-        text = str(exc)
-        lowered = text.lower()
+        # Always carry the exception type. `str(exc)` alone is actively
+        # misleading for the classes that surface here most often: a bare
+        # KeyError renders as "'some_key'", which reached the UI as
+        # Error: 'GenerationError' — quoted, typeless and unactionable.
+        reason = ModelManager._short_reason(exc)
+        lowered = str(exc).lower()
         if "out of memory" in lowered or "cuda oom" in lowered:
             return (
                 "Out of GPU memory. Lower the resolution, frame count or step "
-                f"count and try again. Original error: {text}"
+                f"count and try again. Original error: {reason}"
             )
         if "gpu task aborted" in lowered or "timeout" in lowered:
             return (
                 "The GPU allocation expired before the run finished. Reduce steps "
-                f"or frames. Original error: {text}"
+                f"or frames. Original error: {reason}"
             )
-        return text
+        if isinstance(exc, (KeyError, AttributeError, IndexError)):
+            # A structural mismatch inside the model, not a user parameter:
+            # a checkpoint whose tensors do not line up with the architecture
+            # transformers built for it. The Space logs carry the frame.
+            return (
+                f"The model failed internally ({reason}). This usually means the "
+                "checkpoint and the installed transformers disagree on the "
+                "architecture rather than anything about your prompt. The full "
+                "traceback is in the Space logs."
+            )
+        return reason
 
     def _output_path(self, kind: str, seed: int, extension: str) -> str:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
