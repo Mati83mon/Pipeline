@@ -215,6 +215,7 @@ docs/DEPLOY.md          Deployment and troubleshooting
 |---|---|
 | Text tab says `(fallback)` | The gated 27B model is unreachable. Accept its licence and set `HF_TOKEN`. |
 | `finegrained-fp8 kernel unavailable` | The `kernels` package is missing or out of range. It is a hard requirement of the FP8 text model, not an extra — reinstall from `requirements.txt`. |
+| Answer stops mid-sentence | The run info says which half ran out: reasoning or the answer. Set **Reasoning** to Brief/Off, or raise Max new tokens — then **Continue last answer**. |
 | `No space left on device` | Disk guard could not free enough. Disable a module in `config.json` or raise `disk_headroom_gb`. |
 | "GPU allocation expired" | The render needed more than the requested duration. Cut steps or frames, or raise `gpu_seconds_*`. |
 | Black or empty image | Almost always `fp16` on a T5 encoder. Set `dtype` back to `bfloat16`. |
