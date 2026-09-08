@@ -324,7 +324,7 @@ the offending key path.
 
 ### C15. No tests and no CI
 
-**Fixed:** 150 tests that need neither torch nor a GPU, covering config
+**Fixed:** 151 tests that need neither torch nor a GPU, covering config
 validation, LTX `8n+1` frame alignment and resolution snapping, seed handling,
 log rotation and corruption tolerance, frame normalisation, output pruning and
 the full UI build.
@@ -490,6 +490,10 @@ router — as not-to-be-quantised, and that pattern therefore also swallows
 `...mlp.gate_proj`. It was left a plain `nn.Linear` holding FP8 weights with
 nowhere to put their scales, which is precisely a model that loads and then
 dies in the forward pass.
+
+The model card confirms this independently: `mlp.gate` / `shared_expert_gate`
+are named among the modules kept in BF16, in "the identical 882-entry
+`modules_to_not_convert` as the official FP8".
 
 **Worked around:** `_patch_fp8_module_skip_matching()` replaces the middle
 clause with `re.fullmatch`, which is what the function's own docstring
