@@ -23,6 +23,37 @@ HISTORY_HEADERS = [
 ]
 
 
+# Reasoning choices, in the order a user should meet them. The value on the
+# right is the key `ModelManager.THINKING_MODES` understands; the label is what
+# it costs you, because that is the decision actually being made.
+THINKING_CHOICES = [
+    ("Standard — reasoning, no extra prodding", "standard"),
+    ("Brief — short reasoning, quicker answer", "brief"),
+    ("Deep — validates assumptions, very long", "deep"),
+    ("Off — answer immediately, no reasoning", "off"),
+]
+
+# Presets exist because `max_tokens` / `temperature` / `top_p` / reasoning are
+# four dials whose *interaction* decides whether an answer arrives at all, and
+# that is not something to rediscover per prompt. Each is a point that was
+# actually tried, not a round number.
+TEXT_PRESETS: Dict[str, Dict[str, Any]] = {
+    "Quick answer": {
+        "max_tokens": 700, "temperature": 0.7, "top_p": 0.9, "thinking": "off",
+    },
+    "Standard": {
+        "max_tokens": 1500, "temperature": 1.0, "top_p": 0.95, "thinking": "standard",
+    },
+    "Deep dive": {
+        "max_tokens": 4096, "temperature": 1.0, "top_p": 0.95, "thinking": "deep",
+    },
+    "Creative writing": {
+        "max_tokens": 2000, "temperature": 1.0, "top_p": 0.95, "thinking": "brief",
+    },
+}
+CUSTOM_PRESET = "Custom"
+
+
 def _seed_row() -> tuple[gr.Number, gr.Checkbox]:
     with gr.Row():
         seed = gr.Number(label="Seed", value=0, precision=0, minimum=0, maximum=2**31 - 1)
@@ -167,7 +198,23 @@ def create_text_tab(cfg: Dict[str, Any]) -> Dict[str, Any]:
                         sources=["upload", "clipboard"], height=200,
                     )
                     video = gr.Video(label="Video (optional)", sources=["upload"], height=200)
-                with gr.Accordion("Parameters", open=True):
+                with gr.Row():
+                    preset = gr.Dropdown(
+                        choices=[*TEXT_PRESETS, CUSTOM_PRESET],
+                        value="Standard",
+                        label="Preset",
+                    )
+                    thinking = gr.Dropdown(
+                        choices=THINKING_CHOICES,
+                        value=cfg.get("default_thinking", "standard"),
+                        label="Reasoning",
+                        info=(
+                            "This model reasons before answering. On long prompts "
+                            "that can consume the whole token budget before the "
+                            "answer starts."
+                        ),
+                    )
+                with gr.Accordion("Advanced", open=False):
                     max_tokens = gr.Slider(
                         cfg["min_tokens"], cfg["max_tokens"], cfg["default_max_tokens"],
                         step=32, label="Max new tokens",
@@ -179,15 +226,43 @@ def create_text_tab(cfg: Dict[str, Any]) -> Dict[str, Any]:
                     )
                     top_p = gr.Slider(0.05, 1.0, cfg["default_top_p"], step=0.05, label="Top-p")
                     seed, randomize = _seed_row()
-                button = gr.Button("Generate text", variant="primary")
+                with gr.Row():
+                    button = gr.Button("Generate text", variant="primary")
+                    continue_button = gr.Button("Continue last answer")
             with gr.Column(scale=1):
                 output = gr.Textbox(label="Response", lines=22)
-                info = gr.Textbox(label="Run info", interactive=False, lines=2)
+                info = gr.Textbox(label="Run info", interactive=False, lines=3)
+
+    # Picking a preset moves the dials it owns and leaves everything else alone.
+    preset.change(
+        fn=apply_text_preset,
+        inputs=[preset],
+        outputs=[max_tokens, temperature, top_p, thinking],
+    )
     return {
         "prompt": prompt, "image": image, "video": video, "max_tokens": max_tokens,
         "temperature": temperature, "top_p": top_p, "seed": seed,
         "randomize": randomize, "button": button, "output": output, "info": info,
+        "thinking": thinking, "preset": preset, "continue_button": continue_button,
     }
+
+
+def apply_text_preset(name: str) -> tuple[Any, Any, Any, Any]:
+    """Map a preset name onto the four controls it sets.
+
+    ``Custom`` means "leave what I set", so it returns `gr.update()` sentinels
+    rather than values — otherwise selecting it would silently reset the dials
+    the user had just tuned by hand.
+    """
+    values = TEXT_PRESETS.get(name)
+    if values is None:
+        return gr.update(), gr.update(), gr.update(), gr.update()
+    return (
+        values["max_tokens"],
+        values["temperature"],
+        values["top_p"],
+        values["thinking"],
+    )
 
 
 def create_history_tab(limit: int) -> Dict[str, Any]:

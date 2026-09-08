@@ -86,6 +86,40 @@ tab silently falls back to `Qwen/Qwen3-VL-8B-Instruct`.
 The token is read from the environment at load time and passed to every
 `from_pretrained` call. It is never written to the log or the UI.
 
+### 3. Nothing else
+
+`requirements.txt` is complete. One pin is easy to mistake for optional and is
+not: **`kernels`**. `transformers` implements no FP8 matmul itself — every FP8
+layer loads a Triton kernel from the Hub through that package — so without it
+the 27B checkpoint loads perfectly and then fails on the first forward pass,
+inside the GPU allocation. The Text tab warns at load time if it is missing.
+
+## Reasoning modes (Text tab)
+
+The default text model reasons before answering, and its chat template defaults
+`reasoning_effort` to **`xhigh`** — a level at which the template injects a
+system instruction telling the model to validate assumptions and weigh
+alternatives. On a complex prompt that reliably consumes the entire token
+budget inside `<think>`, and the answer never starts. Raising `max_tokens` does
+not fix it; the reasoning grows to fit.
+
+The **Reasoning** dropdown sets what the template actually supports:
+
+| Mode | Template | Use it for |
+|---|---|---|
+| **Standard** (default) | `reasoning_effort: medium` | Almost everything. No injected instruction. |
+| **Brief** | `reasoning_effort: low` | Short reasoning, quicker answer. |
+| **Deep** | `reasoning_effort: xhigh` | Multi-step logic and maths, when you can afford the wall clock. |
+| **Off** | `enable_thinking: false` | Direct answers. The template pre-closes the think block, so the answer starts immediately. |
+
+**Off** also books a smaller GPU allocation (`gpu_seconds_base_no_thinking`),
+which matters because ZeroGPU quota is spent by the second.
+
+If an answer still runs out of room, the run info says so — and says whether
+the budget went on reasoning or on the answer, because the two have different
+fixes. **Continue last answer** resumes a cut-off reply by feeding it back to
+the model with the original request.
+
 ## Configuration
 
 Everything tunable lives in `config.json`, validated at startup — a typo raises
@@ -136,7 +170,7 @@ with small token budgets; image and video generation are not practical.
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q          # 102 tests, no torch or GPU required
+python -m pytest tests/ -q          # 148 tests, no torch or GPU required
 ```
 
 They cover config validation, LTX frame/resolution alignment, seed handling,
@@ -180,6 +214,7 @@ docs/DEPLOY.md          Deployment and troubleshooting
 | Symptom | Cause and fix |
 |---|---|
 | Text tab says `(fallback)` | The gated 27B model is unreachable. Accept its licence and set `HF_TOKEN`. |
+| `finegrained-fp8 kernel unavailable` | The `kernels` package is missing or out of range. It is a hard requirement of the FP8 text model, not an extra — reinstall from `requirements.txt`. |
 | `No space left on device` | Disk guard could not free enough. Disable a module in `config.json` or raise `disk_headroom_gb`. |
 | "GPU allocation expired" | The render needed more than the requested duration. Cut steps or frames, or raise `gpu_seconds_*`. |
 | Black or empty image | Almost always `fp16` on a T5 encoder. Set `dtype` back to `bfloat16`. |

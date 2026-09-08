@@ -150,6 +150,15 @@ def _pinned_version(package: str) -> str:
     raise AssertionError(f"{package} is not pinned in requirements.txt")
 
 
+def _pinned_range(package: str) -> str:
+    """Return the version specifier for a package pinned as a range, not `==`."""
+    for line in (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines():
+        line = line.split("#")[0].strip()
+        if line.startswith(package) and line[len(package) :].startswith((">", "<", "=", "~")):
+            return line[len(package) :].strip()
+    raise AssertionError(f"{package} is not pinned in requirements.txt")
+
+
 def test_sdk_version_matches_pinned_gradio(front_matter):
     assert front_matter["sdk_version"] == _pinned_version("gradio"), (
         "README sdk_version and the gradio pin in requirements.txt must agree, "
@@ -683,6 +692,69 @@ def test_skip_matching_patch_is_idempotent(tmp_path, monkeypatch):
     assert manager._patch_fp8_module_skip_matching() is None
 
 
+def _install_kernels_probe(monkeypatch, available):
+    """Stub transformers.utils.import_utils.is_kernels_available.
+
+    `available=None` installs no probe at all, standing in for a transformers
+    too old to have one.
+    """
+    import types
+
+    root = types.ModuleType("transformers")
+    utils = types.ModuleType("transformers.utils")
+    import_utils = types.ModuleType("transformers.utils.import_utils")
+    if available is not None:
+        import_utils.is_kernels_available = lambda *a, **k: available
+    utils.import_utils = import_utils
+    root.utils = utils
+    for name, mod in (
+        ("transformers", root),
+        ("transformers.utils", utils),
+        ("transformers.utils.import_utils", import_utils),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+
+
+def test_missing_fp8_kernels_are_reported(tmp_path, monkeypatch):
+    """Without `kernels` the checkpoint loads and dies in the forward pass."""
+    _install_kernels_probe(monkeypatch, available=False)
+    reported = _manager(tmp_path)._check_fp8_kernels()
+    assert reported is not None
+    assert "kernels" in reported
+    assert "0.16" in reported
+
+
+def test_present_fp8_kernels_report_nothing(tmp_path, monkeypatch):
+    _install_kernels_probe(monkeypatch, available=True)
+    assert _manager(tmp_path)._check_fp8_kernels() is None
+
+
+def test_fp8_kernel_probe_is_never_fatal(tmp_path, monkeypatch):
+    """A transformers without the helper must not break loading."""
+    _install_kernels_probe(monkeypatch, available=None)
+    assert _manager(tmp_path)._check_fp8_kernels() is None
+
+
+def test_fp8_load_surfaces_the_kernel_warning_to_the_ui(tmp_path, monkeypatch):
+    """The notice must reach the user before a GPU allocation is spent."""
+    from pipeline.models import ModelManager
+
+    manager = _manager(tmp_path)
+    monkeypatch.setitem(
+        sys.modules, "transformers", _fake_transformers({"quant_method": "fp8"}, [])
+    )
+    monkeypatch.setattr(
+        ModelManager, "_check_fp8_kernels", staticmethod(lambda: "kernels are missing")
+    )
+    manager._load_llm("some/model", {"dtype": "bfloat16", "multimodal": True})
+    assert "kernels are missing" in manager.take_notices()
+
+
+def test_requirements_pin_the_fp8_kernel_package():
+    """transformers routes every FP8 matmul through `kernels`; it is not optional."""
+    assert _pinned_range("kernels") == ">=0.16,<0.17"
+
+
 @pytest.mark.parametrize(
     "exc,expected",
     [
@@ -715,6 +787,223 @@ def test_output_paths_are_unique_per_seed(tmp_path):
     second = manager._output_path("image", 2, "png")
     assert first != second
     assert first.endswith("_1.png") and second.endswith("_2.png")
+
+
+# ---------------------------------------------------------------------------
+# Reasoning modes
+#
+# The default text model's chat template reads `enable_thinking` and validates
+# `reasoning_effort` itself:
+#
+#     {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+#     {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
+#         {{- raise_exception('Unexpected reasoning effort ...') }}
+#
+# so an invalid preset is not a bad default, it is a hard failure at generation
+# time. These tests pin the contract to what the template accepts.
+# ---------------------------------------------------------------------------
+
+
+TEMPLATE_EFFORTS = {"xhigh", "medium", "low"}
+
+
+def test_thinking_modes_only_use_efforts_the_template_accepts():
+    from pipeline.models import THINKING_MODES
+
+    for name, kwargs in THINKING_MODES.items():
+        effort = kwargs.get("reasoning_effort")
+        assert effort is None or effort in TEMPLATE_EFFORTS, name
+        assert isinstance(kwargs["enable_thinking"], bool), name
+
+
+def test_thinking_off_sends_no_reasoning_effort():
+    """With thinking disabled the template skips the effort block entirely."""
+    from pipeline.models import THINKING_MODES
+
+    assert THINKING_MODES["off"] == {"enable_thinking": False}
+
+
+def test_every_preset_names_a_real_thinking_mode():
+    import ui_components as ui
+
+    from pipeline.models import THINKING_MODES
+
+    for name, values in ui.TEXT_PRESETS.items():
+        assert values["thinking"] in THINKING_MODES, name
+
+
+def test_thinking_dropdown_offers_exactly_the_known_modes():
+    import ui_components as ui
+
+    from pipeline.models import THINKING_MODES
+
+    assert {value for _, value in ui.THINKING_CHOICES} == set(THINKING_MODES)
+
+
+@pytest.mark.parametrize(
+    "given,expected",
+    [("deep", "deep"), ("OFF", "off"), (" brief ", "brief"), (None, "standard"),
+     ("nonsense", "standard"), ("", "standard")],
+)
+def test_thinking_key_is_normalised(tmp_path, given, expected):
+    assert _manager(tmp_path)._thinking_key(given) == expected
+
+
+def test_default_config_names_a_real_thinking_mode():
+    from pipeline.models import THINKING_MODES
+
+    config = load_config(REPO_ROOT / "config.json")
+    assert config.llm["default_thinking"] in THINKING_MODES
+
+
+def test_apply_template_forwards_the_reasoning_kwargs(tmp_path):
+    seen = {}
+
+    def apply(messages, **kwargs):
+        seen.update(kwargs)
+        return "prompt"
+
+    result = _manager(tmp_path)._apply_template(
+        apply, [], {"enable_thinking": True, "reasoning_effort": "low"}, tokenize=False
+    )
+    assert result == "prompt"
+    assert seen == {"tokenize": False, "enable_thinking": True, "reasoning_effort": "low"}
+
+
+def test_apply_template_retries_without_kwargs_a_template_rejects(tmp_path):
+    """The fallback model's template has never heard of these flags."""
+    calls = []
+
+    def apply(messages, **kwargs):
+        calls.append(kwargs)
+        if "reasoning_effort" in kwargs:
+            raise ValueError("Unexpected reasoning effort")
+        return "plain prompt"
+
+    result = _manager(tmp_path)._apply_template(
+        apply, [], {"enable_thinking": True, "reasoning_effort": "low"}
+    )
+    assert result == "plain prompt"
+    assert len(calls) == 2 and calls[1] == {}
+
+
+def test_apply_template_does_not_swallow_a_real_failure(tmp_path):
+    def apply(messages, **kwargs):
+        raise RuntimeError("template is broken")
+
+    with pytest.raises(RuntimeError, match="template is broken"):
+        _manager(tmp_path)._apply_template(apply, [], {})
+
+
+def test_build_llm_inputs_passes_the_selected_mode(tmp_path):
+    seen = {}
+
+    class _Tokenizer:
+        @staticmethod
+        def apply_chat_template(messages, **kwargs):
+            seen.update(kwargs)
+            return "text"
+
+        def __call__(self, text, **kwargs):
+            class _T:
+                def to(self, device):
+                    return self
+
+            return {"input_ids": _T()}
+
+    _manager(tmp_path)._build_llm_inputs(
+        {"system_prompt": "s"}, None, _Tokenizer(), "hi", [], thinking="off"
+    )
+    assert seen["enable_thinking"] is False
+    assert "reasoning_effort" not in seen
+
+
+# ---------------------------------------------------------------------------
+# Truncation detection
+# ---------------------------------------------------------------------------
+
+
+class _FakeGenerated:
+    """Minimal stand-in for the generated-token tensor slice."""
+
+    def __init__(self, ids):
+        self._ids = list(ids)
+        self.shape = (len(self._ids),)
+
+    def __getitem__(self, index):
+        return self._ids[index]
+
+
+class _FakeModel:
+    def __init__(self, eos):
+        self.generation_config = type("GC", (), {"eos_token_id": eos})()
+
+
+def test_answer_that_ends_on_eos_is_not_truncated(tmp_path):
+    manager = _manager(tmp_path)
+    assert not manager._hit_token_ceiling(
+        _FakeGenerated([1, 2, 151645]), _FakeModel(151645), None, None, 3
+    )
+
+
+def test_answer_that_fills_the_budget_without_eos_is_truncated(tmp_path):
+    manager = _manager(tmp_path)
+    assert manager._hit_token_ceiling(
+        _FakeGenerated([1, 2, 3]), _FakeModel(151645), None, None, 3
+    )
+
+
+def test_short_answer_is_never_reported_as_truncated(tmp_path):
+    """An early stop on a stop-string is a finished answer, not a cut-off one."""
+    manager = _manager(tmp_path)
+    assert not manager._hit_token_ceiling(
+        _FakeGenerated([1, 2]), _FakeModel(151645), None, None, 512
+    )
+
+
+def test_eos_ids_are_collected_from_a_list(tmp_path):
+    manager = _manager(tmp_path)
+    assert not manager._hit_token_ceiling(
+        _FakeGenerated([1, 2, 7]), _FakeModel([151643, 7]), None, None, 3
+    )
+
+
+def test_truncation_check_never_raises_on_an_odd_tensor(tmp_path):
+    assert _manager(tmp_path)._hit_token_ceiling(
+        object(), _FakeModel(1), None, None, 10
+    ) is False
+
+
+class _Decoder:
+    def __init__(self, raw):
+        self._raw = raw
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "" if skip_special_tokens else self._raw
+
+
+def test_advice_points_at_reasoning_when_the_think_block_never_closed(tmp_path):
+    advice = _manager(tmp_path)._truncation_advice(
+        _FakeGenerated([1]), _Decoder("<think>still going"), "standard"
+    )
+    assert "reasoning" in advice.lower()
+    assert "Brief" in advice or "Off" in advice
+
+
+def test_advice_does_not_suggest_lowering_reasoning_when_it_is_already_off(tmp_path):
+    advice = _manager(tmp_path)._truncation_advice(
+        _FakeGenerated([1]), _Decoder("<think>odd"), "off"
+    )
+    assert "Max new tokens" in advice
+    assert "Brief" not in advice
+
+
+def test_advice_points_at_the_limit_when_the_answer_itself_was_cut(tmp_path):
+    advice = _manager(tmp_path)._truncation_advice(
+        _FakeGenerated([1]), _Decoder("<think>done</think>the answer"), "standard"
+    )
+    assert "Max new tokens" in advice
+    assert "reasoning" not in advice.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -785,3 +1074,179 @@ def test_history_handler_maps_columns(app_module, tmp_path, monkeypatch):
 def test_ui_builds(app_module):
     demo = app_module.build_ui()
     assert demo.blocks
+
+
+# ---------------------------------------------------------------------------
+# The ZeroGPU worker boundary
+#
+# `spaces` ships a failed GPU task back to the parent as
+# `ExceptionResult(traceback, error_cls, gradio_error)` and keeps the exception
+# object itself only when it is a `gr.Error`; anything else is re-raised in the
+# parent from its class name alone. That is how a `GenerationError` carrying a
+# real diagnosis arrived in the UI as `Error: 'GenerationError'`.
+# ---------------------------------------------------------------------------
+
+
+def test_gpu_safe_passes_results_through(app_module):
+    assert app_module._gpu_safe(lambda a, b: (a, b))(1, 2) == (1, 2)
+
+
+def test_gpu_safe_preserves_the_wrapped_name(app_module):
+    def _inner():
+        return None
+
+    assert app_module._gpu_safe(_inner).__name__ == "_inner"
+
+
+def test_gpu_safe_converts_backend_errors_to_gradio_errors(app_module):
+    """The regression: only a gr.Error survives the ZeroGPU worker boundary."""
+    import gradio as gr
+
+    from pipeline.models import GenerationError
+
+    message = "ImportError: finegrained-fp8 kernel unavailable: kernels missing"
+
+    @app_module._gpu_safe
+    def _task():
+        raise GenerationError(message)
+
+    with pytest.raises(gr.Error) as caught:
+        _task()
+    assert message in str(caught.value)
+
+
+def test_gpu_safe_does_not_rewrap_a_gradio_error(app_module):
+    import gradio as gr
+
+    original = gr.Error("already actionable")
+
+    @app_module._gpu_safe
+    def _task():
+        raise original
+
+    with pytest.raises(gr.Error) as caught:
+        _task()
+    assert caught.value is original
+
+
+def test_converted_error_survives_the_process_boundary(app_module):
+    """`spaces` pickles the gr.Error to the parent process — the message must live."""
+    import pickle
+
+    import gradio as gr
+
+    from pipeline.models import GenerationError
+
+    message = "the model failed internally (KeyError: 'router')"
+    error = app_module._fail(GenerationError(message))
+    restored = pickle.loads(pickle.dumps(error))
+    assert isinstance(restored, gr.Error)
+    assert message in str(restored)
+
+
+def test_fail_returns_a_gradio_error_unchanged(app_module):
+    import gradio as gr
+
+    error = gr.Error("Prompt cannot be empty.")
+    assert app_module._fail(error) is error
+
+
+def test_fail_names_the_type_of_an_unexpected_error(app_module):
+    assert "TypeError" in str(app_module._fail(TypeError("bad argument")))
+
+
+def test_reasoning_off_asks_for_a_shorter_gpu_allocation(app_module):
+    """Quota is charged by the second; a no-reasoning run must not book for one."""
+    args = ("prompt", None, None, 1000, 1.0, 0.95, 1)
+    thinking_seconds = app_module._text_duration(*args, "standard")
+    quick_seconds = app_module._text_duration(*args, "off")
+    assert quick_seconds < thinking_seconds
+    assert quick_seconds == pytest.approx(90 + 10.0 * 10)
+
+
+def test_duration_defaults_to_the_thinking_budget(app_module):
+    """An unknown or missing mode must never under-book the allocation."""
+    args = ("prompt", None, None, 1000, 1.0, 0.95, 1)
+    assert app_module._text_duration(*args) == app_module._text_duration(*args, "deep")
+
+
+def test_preset_sets_all_four_controls():
+    import ui_components as ui
+
+    max_tokens, temperature, top_p, thinking = ui.apply_text_preset("Quick answer")
+    assert (max_tokens, temperature, top_p, thinking) == (700, 0.7, 0.9, "off")
+
+
+@pytest.mark.parametrize("name", ["Custom", "a preset that was renamed"])
+def test_unknown_preset_leaves_the_dials_alone(name):
+    """Selecting Custom must not reset values the user just tuned by hand.
+
+    `gr.update()` with no `value` is Gradio's "change nothing" sentinel; a bare
+    value here would silently overwrite the sliders instead.
+    """
+    import ui_components as ui
+
+    updates = ui.apply_text_preset(name)
+    assert len(updates) == 4
+    for update in updates:
+        assert update == {"__type__": "update"}
+
+
+def test_continue_without_a_previous_answer_is_rejected(app_module):
+    import gradio as gr
+
+    with pytest.raises(gr.Error, match="Nothing to continue"):
+        app_module.handle_continue(
+            "carry on", "", None, None, 512, 1.0, 0.95, 1, True, "standard"
+        )
+
+
+def test_continuation_prompt_carries_the_previous_answer(app_module):
+    previous = "The first half of a long answer."
+    built = app_module.CONTINUATION_TEMPLATE.format(previous=previous, prompt="Explain X")
+    assert previous in built
+    assert "Explain X" in built
+    assert "not repeat" in built.lower()
+
+
+def test_continuation_is_not_rejected_for_exceeding_the_typed_prompt_limit(
+    app_module, monkeypatch
+):
+    """A long answer is exactly what is worth continuing; the cap guards typing."""
+    seen = {}
+
+    def _capture(prompt, *args, **kwargs):
+        seen["prompt"] = prompt
+        return "", "", *("", ""), ""
+
+    monkeypatch.setattr(app_module, "_run_text", _capture)
+    previous = "x" * (app_module.MAX_PROMPT_CHARS * 2)
+    app_module.handle_continue(
+        "go on", previous, None, None, 512, 1.0, 0.95, 1, True, "standard"
+    )
+    assert previous in seen["prompt"]
+
+
+@pytest.mark.parametrize(
+    "task,method,arity",
+    [
+        ("_gpu_image", "generate_image", 7),
+        ("_gpu_video", "generate_video", 10),
+        ("_gpu_text", "generate_text", 8),
+    ],
+)
+def test_every_gpu_task_converts_before_the_boundary(
+    app_module, monkeypatch, task, method, arity
+):
+    """Guards the decorator itself: drop `@_gpu_safe` and the message is lost."""
+    import gradio as gr
+
+    from pipeline.models import GenerationError
+
+    def _boom(*args, **kwargs):
+        raise GenerationError("a diagnosis worth keeping")
+
+    monkeypatch.setattr(app_module.MANAGER, method, _boom)
+    with pytest.raises(gr.Error) as caught:
+        getattr(app_module, task)(*[None] * arity)
+    assert "a diagnosis worth keeping" in str(caught.value)

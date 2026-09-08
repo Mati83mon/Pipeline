@@ -77,8 +77,13 @@
     "min_temperature": 0.0,
     "max_temperature": 2.0,
     "max_video_frames": 8,
-    "gpu_seconds_base": 50,
-    "gpu_seconds_per_100_tokens": 6.0
+    "gpu_seconds_base": 300,
+    "gpu_seconds_per_100_tokens": 10.0,
+    "$comment_gpu_seconds": "Raised from 50/6.0 after a live timeout: the ZeroGPU window must cover the CPU->CUDA transfer of ~30GB of FP8 weights AND the first-use JIT compile of the kernels-community/finegrained-fp8 Triton kernel, observed taking well over a minute. The old 86s allocation was killed mid-run (release?fail=true in the Space logs). gpu_seconds_base is the fallback when the per-mode bases below are absent.",
+    "gpu_seconds_base_thinking": 300,
+    "gpu_seconds_base_no_thinking": 90,
+    "$comment_thinking": "The chat template of orcarouter/Qwen3.8-27B-Uncensored-FP8 defaults reasoning_effort to 'xhigh' and injects a system instruction telling the model to validate assumptions and consider alternatives. That is why complex prompts spent 1500-2500+ tokens inside <think> and never reached the answer. default_thinking picks the startup preset; see THINKING_MODES in pipeline/models.py for the four the template actually accepts.",
+    "default_thinking": "standard"
   },
   "system": {
     "output_dir": "outputs",
