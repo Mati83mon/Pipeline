@@ -1003,9 +1003,14 @@ class ModelManager:
         Running out of budget *inside* the reasoning block is a different
         problem from running out while writing the answer: the first is solved
         by spending fewer tokens on reasoning, the second by raising the limit.
-        Decoding without ``skip_special_tokens`` is what makes the two
-        distinguishable — ``<think>`` and ``</think>`` are special tokens and
-        the user-facing decode drops them.
+
+        The decode passes ``skip_special_tokens=False`` so this works whatever
+        a given tokenizer decides these markers are. In this checkpoint they
+        are added tokens with ``"special": false``
+        (``tokenizer_config.json``: ids 248068/248069, unlike ``<|im_end|>``
+        which is ``true``), so the user-facing decode does *not* drop them and
+        both decodes contain them. Another model's tokenizer may well mark
+        them special, and then only this decode would see them.
         """
         advice = (
             "The answer hit the max-tokens limit and did not finish. "
