@@ -324,7 +324,7 @@ the offending key path.
 
 ### C15. No tests and no CI
 
-**Fixed:** 148 tests that need neither torch nor a GPU, covering config
+**Fixed:** 150 tests that need neither torch nor a GPU, covering config
 validation, LTX `8n+1` frame alignment and resolution snapping, seed handling,
 log rotation and corruption tolerance, frame normalisation, output pruning and
 the full UI build.
@@ -699,9 +699,17 @@ flags every early stop on a stop-string.
 `_truncation_advice` then names the fix rather than the symptom, because the
 two cases have different remedies. Running out *inside* the reasoning block
 means spend fewer tokens reasoning; running out while writing the answer means
-raise the limit. Telling them apart needs a decode with
-`skip_special_tokens=False` — `<think>` and `</think>` are special tokens, so
-the user-facing decode drops them.
+raise the limit. It decodes with `skip_special_tokens=False` so the check holds
+whatever a tokenizer decides these markers are.
+
+> **Corrected.** This section first claimed `<think>` and `</think>` are
+> special tokens and therefore absent from the user-facing decode. They are
+> not. `tokenizer_config.json` registers them as added tokens with
+> `"special": false` (ids 248068/248069) — unlike `<|im_end|>`, which is
+> `true`. The consequence is not cosmetic: `skip_special_tokens=True` leaves
+> them in, so **the whole reasoning block is shown to the user in the Response
+> box**, which is why a truncated answer appears there as `<think>…` and
+> nothing else. See F6.
 
 ### F3. The Text tab could not continue its own answer
 
@@ -742,6 +750,52 @@ stays visible next to it because it is the one that decides whether an answer
 fits, and the raw sliders move into a closed `Advanced` accordion. `Custom`
 returns Gradio's no-change sentinel rather than values, so selecting it cannot
 overwrite dials the user just tuned.
+
+### F6. The reasoning block is shown to the user, and nothing separates it
+
+Open, not fixed — it needs a decision rather than a patch.
+
+A test session reported the model emitting a visible `<think>…</think>` even
+with reasoning switched off, and attributed it to three exotic causes: the
+`enable_thinking` flag being ignored by Ollama and deprecated in llama.cpp,
+side effects of abliteration on the mode switch, and the instability of
+prompt-level switches in multi-turn chat.
+
+None of those describe this app. It calls `processor.apply_chat_template(...,
+enable_thinking=False)` directly through `transformers` — the template-level
+flag, not a prompt-level `/no_think` — with no Ollama or llama.cpp in the
+path, and the Text tab is single-turn and stateless, so there is no multi-turn
+switch to destabilise.
+
+The mundane explanation is in the tokenizer. `<think>` and `</think>` are
+registered as added tokens with `"special": false`, so
+`skip_special_tokens=True` does **not** remove them:
+
+```json
+"248068": { "content": "<think>",  "special": false },
+"248069": { "content": "</think>", "special": false }
+```
+
+Everything the model reasons through therefore lands in the Response box
+verbatim. That is not a leak of a disabled mode; it is the reasoning being
+displayed because nothing was ever written to hide it. It also explains why a
+truncated answer looks like `<think>…` and nothing else: the answer never
+started, and the box is showing the part that did.
+
+Whether that is a bug depends on what the box is for, which is why this is
+recorded rather than fixed. The reasoning has been genuinely useful in
+testing — it is where the model was seen fact-checking its own figures — so
+silently discarding it would destroy the most informative thing on the screen.
+Splitting `response.partition("</think>")` into a collapsible reasoning panel
+and a clean answer keeps both. That is a UI change with a real trade-off, and
+the operator should pick it.
+
+Separately: with reasoning **off** the template pre-writes an empty
+`<think>\n\n</think>` into the *prompt*, and `generate_text` slices the prompt
+off before decoding, so those two markers cannot reach the output. A `<think>`
+appearing in the response of a reasoning-off run is therefore the model
+emitting a new one, not the template's — which would be a genuine finding, and
+worth a log if it recurs on this stack.
 
 ### Not done
 

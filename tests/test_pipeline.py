@@ -975,11 +975,44 @@ def test_truncation_check_never_raises_on_an_odd_tensor(tmp_path):
 
 
 class _Decoder:
+    """A tokenizer that treats `<think>` as special, so the plain decode drops it."""
+
     def __init__(self, raw):
         self._raw = raw
 
     def decode(self, ids, skip_special_tokens=True):
         return "" if skip_special_tokens else self._raw
+
+
+class _PlainDecoder:
+    """A tokenizer that does not.
+
+    This checkpoint is the second kind: `tokenizer_config.json` registers
+    `<think>` / `</think>` as added tokens with `"special": false`, so both
+    decodes contain them. The advice must not depend on which kind it gets —
+    an earlier version of this code was documented on the wrong assumption.
+    """
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def decode(self, ids, skip_special_tokens=True):
+        return self._raw
+
+
+@pytest.mark.parametrize("decoder_cls", [_Decoder, _PlainDecoder])
+def test_advice_does_not_depend_on_how_think_tags_are_classified(
+    tmp_path, decoder_cls
+):
+    manager = _manager(tmp_path)
+    unfinished = manager._truncation_advice(
+        _FakeGenerated([1]), decoder_cls("<think>still going"), "standard"
+    )
+    finished = manager._truncation_advice(
+        _FakeGenerated([1]), decoder_cls("<think>done</think>an answer"), "standard"
+    )
+    assert "reasoning" in unfinished.lower()
+    assert "reasoning" not in finished.lower()
 
 
 def test_advice_points_at_reasoning_when_the_think_block_never_closed(tmp_path):
