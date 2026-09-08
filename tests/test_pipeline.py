@@ -170,6 +170,20 @@ def test_torch_pin_is_supported_by_zerogpu():
     assert _pinned_version("torch") in {"2.8.0", "2.9.1", "2.10.0", "2.11.0"}
 
 
+def test_space_sync_workflow_is_gated_on_the_secret():
+    """It must skip, not fail, on a checkout with no HF_TOKEN configured.
+
+    Without the gate, merging this workflow turns CI red for anyone who has not
+    opted in — and a red default branch is exactly the signal you cannot afford
+    to teach people to ignore.
+    """
+    workflow = (REPO_ROOT / ".github/workflows/sync-space.yml").read_text(encoding="utf-8")
+    assert "steps.gate.outputs.ready == 'true'" in workflow
+    assert 'if [ -z "$HF_TOKEN" ]' in workflow
+    # The token may only ever arrive through the secrets context.
+    assert "hf_" not in workflow.lower().replace("hf_token", "")
+
+
 def test_declared_models_cover_the_configured_ones(front_matter):
     declared = set(front_matter.get("models", []))
     config = load_config(REPO_ROOT / "config.json")

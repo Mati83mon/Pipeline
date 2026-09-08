@@ -1,0 +1,62 @@
+name: Sync to Hugging Face Space
+
+# Mirrors `main` into the Space so the two cannot drift.
+#
+# Every drift this repository has suffered came from syncing by hand: a file
+# edited directly on the Space, a commit that landed 32 seconds after a merge,
+# a paragraph added to one copy and not the other. Each was caught, but only by
+# looking. This makes `main` the single source of truth and removes the step
+# where a human has to remember.
+#
+# Inert until an HF token with **write** scope is added as the `HF_TOKEN`
+# repository secret (Settings -> Secrets and variables -> Actions). Without it
+# the job is skipped, not failed — so merging this workflow cannot turn CI red
+# on a repository that has not opted in.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: sync-space
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Push main to the Space
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check the token is configured
+        id: gate
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "HF_TOKEN is not set — skipping the Space sync." >&2
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Full history: the Space is a git repo of its own and a shallow clone
+      # cannot be pushed onto it without a force.
+      - uses: actions/checkout@v7
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Push to the Space
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SPACE: Mati83moni/ai-media-pipeline
+        run: |
+          set -euo pipefail
+          # The token goes in the remote URL, which git never prints; the URL
+          # itself is never echoed. `set -x` stays off for the same reason.
+          git remote add space "https://user:${HF_TOKEN}@huggingface.co/spaces/${SPACE}"
+          git push --force space HEAD:main
+          echo "Synced $(git rev-parse --short HEAD) to https://huggingface.co/spaces/${SPACE}"
