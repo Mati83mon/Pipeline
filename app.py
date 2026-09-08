@@ -183,16 +183,31 @@ def _gpu_video(prompt, negative, image, width, height, frames, fps, steps, guida
     )
 
 
-def _text_duration(prompt, image, video, max_tokens, temperature, top_p, seed) -> float:
+def _text_duration(
+    prompt, image, video, max_tokens, temperature, top_p, seed, thinking=None
+) -> float:
+    """Reasoning costs wall clock that the token budget alone does not predict.
+
+    A single base stretched to cover the worst case buys every quick prompt a
+    ZeroGPU allocation it will never use, and quota is charged by the second.
+    With reasoning off the model starts emitting the answer immediately, so it
+    gets the smaller base.
+    """
     cfg = CONFIG.llm
-    return float(cfg.get("gpu_seconds_base", 50)) + float(
-        cfg.get("gpu_seconds_per_100_tokens", 6.0)
+    fallback = cfg.get("gpu_seconds_base", 300)
+    key = (
+        "gpu_seconds_base_no_thinking"
+        if str(thinking or "").lower() == "off"
+        else "gpu_seconds_base_thinking"
+    )
+    return float(cfg.get(key, fallback)) + float(
+        cfg.get("gpu_seconds_per_100_tokens", 10.0)
     ) * (float(max_tokens or 100) / 100.0)
 
 
 @gpu_task(duration=_text_duration)
 @_gpu_safe
-def _gpu_text(prompt, image, video, max_tokens, temperature, top_p, seed):
+def _gpu_text(prompt, image, video, max_tokens, temperature, top_p, seed, thinking=None):
     return MANAGER.generate_text(
         prompt=prompt,
         image=image,
@@ -201,6 +216,7 @@ def _gpu_text(prompt, image, video, max_tokens, temperature, top_p, seed):
         temperature=temperature,
         top_p=top_p,
         seed=seed,
+        thinking=thinking,
     )
 
 
@@ -254,24 +270,75 @@ def handle_video(
     return path, _run_info("video", seed, duration, path), *_status()
 
 
-def handle_text(
-    prompt, image, video, max_tokens, temperature, top_p, seed, randomize,
-    progress=gr.Progress(),
+CONTINUATION_TEMPLATE = (
+    "Here is the beginning of your previous answer, which was cut off before "
+    "it finished:\n\n---\n{previous}\n---\n\nContinue from exactly where it "
+    "stops, in the same style and language. Do not repeat anything already "
+    "written and do not start over.\n\nThe original request was:\n{prompt}"
+)
+
+
+def _run_text(
+    prompt, image, video, max_tokens, temperature, top_p, seed, randomize, thinking,
+    progress,
 ):
-    prompt = _clean_prompt(prompt)
+    """Shared body of the two text handlers.
+
+    Takes the prompt already validated. `MAX_PROMPT_CHARS` guards what a person
+    types; a continuation prompt is assembled by this app from an answer the
+    model itself just produced, and re-checking it against a limit meant for
+    typed input would reject exactly the long answers worth continuing.
+    """
     seed = _resolve_seed(seed, randomize)
     try:
         progress(0.1, desc="Preparing model (first run downloads ~31 GB)…")
         MANAGER.ensure_loaded("llm")
-        eta = int(_text_duration(prompt, image, video, max_tokens, temperature, top_p, seed))
+        eta = int(
+            _text_duration(
+                prompt, image, video, max_tokens, temperature, top_p, seed, thinking
+            )
+        )
         progress(0.4, desc=f"Generating on GPU (up to ~{eta}s)…")
         response, path, duration = _gpu_text(
-            prompt, image, video, int(max_tokens), float(temperature), float(top_p), seed
+            prompt, image, video, int(max_tokens), float(temperature), float(top_p),
+            seed, thinking,
         )
     except Exception as exc:  # noqa: BLE001
         raise _fail(exc) from exc
     progress(1.0, desc="Done")
-    return response, _run_info("text", seed, duration, path), *_status()
+    return response, _run_info("text", seed, duration, path), *_status(), response
+
+
+def handle_text(
+    prompt, image, video, max_tokens, temperature, top_p, seed, randomize, thinking,
+    progress=gr.Progress(),
+):
+    return _run_text(
+        _clean_prompt(prompt), image, video, max_tokens, temperature, top_p, seed,
+        randomize, thinking, progress,
+    )
+
+
+def handle_continue(
+    prompt, previous, image, video, max_tokens, temperature, top_p, seed, randomize,
+    thinking, progress=gr.Progress(),
+):
+    """Resume a cut-off answer by feeding it back in.
+
+    The Text tab is stateless by design — one model resident at a time, no
+    session store — so "carry on" means nothing to the model unless the text to
+    carry on from travels with the prompt. This is the whole of that state: the
+    last answer, held in a `gr.State` for exactly this button.
+    """
+    if not (previous or "").strip():
+        raise gr.Error("Nothing to continue yet — generate an answer first.")
+    return _run_text(
+        CONTINUATION_TEMPLATE.format(
+            previous=previous.strip(), prompt=_clean_prompt(prompt)
+        ),
+        image, video, max_tokens, temperature, top_p, seed, randomize, thinking,
+        progress,
+    )
 
 
 def handle_history() -> List[List[Any]]:
@@ -377,14 +444,24 @@ def build_ui() -> gr.Blocks:
                 outputs=[video_ui["output"], video_ui["info"], *status_targets],
             )
         if text_ui:
+            # The only state the Text tab keeps: the last answer, so
+            # "Continue last answer" has something to continue.
+            last_answer = gr.State("")
+            text_inputs = [
+                text_ui["prompt"], text_ui["image"], text_ui["video"],
+                text_ui["max_tokens"], text_ui["temperature"], text_ui["top_p"],
+                text_ui["seed"], text_ui["randomize"], text_ui["thinking"],
+            ]
+            text_outputs = [
+                text_ui["output"], text_ui["info"], *status_targets, last_answer,
+            ]
             text_ui["button"].click(
-                fn=handle_text,
-                inputs=[
-                    text_ui["prompt"], text_ui["image"], text_ui["video"],
-                    text_ui["max_tokens"], text_ui["temperature"], text_ui["top_p"],
-                    text_ui["seed"], text_ui["randomize"],
-                ],
-                outputs=[text_ui["output"], text_ui["info"], *status_targets],
+                fn=handle_text, inputs=text_inputs, outputs=text_outputs
+            )
+            text_ui["continue_button"].click(
+                fn=handle_continue,
+                inputs=[text_inputs[0], last_answer, *text_inputs[1:]],
+                outputs=text_outputs,
             )
 
         history_ui["refresh"].click(fn=handle_history, outputs=[history_ui["table"]])

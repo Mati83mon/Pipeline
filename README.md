@@ -94,6 +94,32 @@ layer loads a Triton kernel from the Hub through that package — so without it
 the 27B checkpoint loads perfectly and then fails on the first forward pass,
 inside the GPU allocation. The Text tab warns at load time if it is missing.
 
+## Reasoning modes (Text tab)
+
+The default text model reasons before answering, and its chat template defaults
+`reasoning_effort` to **`xhigh`** — a level at which the template injects a
+system instruction telling the model to validate assumptions and weigh
+alternatives. On a complex prompt that reliably consumes the entire token
+budget inside `<think>`, and the answer never starts. Raising `max_tokens` does
+not fix it; the reasoning grows to fit.
+
+The **Reasoning** dropdown sets what the template actually supports:
+
+| Mode | Template | Use it for |
+|---|---|---|
+| **Standard** (default) | `reasoning_effort: medium` | Almost everything. No injected instruction. |
+| **Brief** | `reasoning_effort: low` | Short reasoning, quicker answer. |
+| **Deep** | `reasoning_effort: xhigh` | Multi-step logic and maths, when you can afford the wall clock. |
+| **Off** | `enable_thinking: false` | Direct answers. The template pre-closes the think block, so the answer starts immediately. |
+
+**Off** also books a smaller GPU allocation (`gpu_seconds_base_no_thinking`),
+which matters because ZeroGPU quota is spent by the second.
+
+If an answer still runs out of room, the run info says so — and says whether
+the budget went on reasoning or on the answer, because the two have different
+fixes. **Continue last answer** resumes a cut-off reply by feeding it back to
+the model with the original request.
+
 ## Configuration
 
 Everything tunable lives in `config.json`, validated at startup — a typo raises
@@ -144,7 +170,7 @@ with small token budgets; image and video generation are not practical.
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q          # 117 tests, no torch or GPU required
+python -m pytest tests/ -q          # 148 tests, no torch or GPU required
 ```
 
 They cover config validation, LTX frame/resolution alignment, seed handling,

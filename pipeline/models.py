@@ -44,6 +44,32 @@ LOGGER = logging.getLogger("pipeline.models")
 
 MODULES = ("image", "video", "llm")
 
+# Reasoning presets, expressed as the chat-template kwargs they map to.
+#
+# These are not invented: the template of the default text model reads both
+# flags and validates one of them itself::
+#
+#     {%- if enable_thinking is undefined or enable_thinking is true %}
+#         {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+#         {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
+#             {{- raise_exception('Unexpected reasoning effort ...') }}
+#
+# Two consequences worth spelling out. First, the *default* is ``xhigh``, and
+# at that level the template injects a system instruction telling the model to
+# "think carefully through the task, validate key assumptions, consider
+# plausible alternatives" — which is exactly the behaviour that made complex
+# prompts spend their whole token budget inside ``<think>`` and never reach an
+# answer. ``medium`` injects no instruction at all; it is the neutral setting,
+# not a degraded one. Second, an effort value outside that tuple raises inside
+# Jinja, so the choice cannot be a free-text field.
+THINKING_MODES: Dict[str, Dict[str, Any]] = {
+    "deep": {"enable_thinking": True, "reasoning_effort": "xhigh"},
+    "standard": {"enable_thinking": True, "reasoning_effort": "medium"},
+    "brief": {"enable_thinking": True, "reasoning_effort": "low"},
+    "off": {"enable_thinking": False},
+}
+DEFAULT_THINKING = "standard"
+
 
 class ModelLoadError(RuntimeError):
     """Raised when neither the primary nor the fallback model can be loaded."""
@@ -827,6 +853,7 @@ class ModelManager:
         temperature: float,
         top_p: float,
         seed: int,
+        thinking: Optional[str] = None,
     ) -> Tuple[str, str, float]:
         import torch
 
@@ -852,7 +879,9 @@ class ModelManager:
         model = self._to_device(loaded, device)
         torch.manual_seed(int(seed))
 
-        inputs = self._build_llm_inputs(cfg, processor, tokenizer, prompt, media)
+        inputs = self._build_llm_inputs(
+            cfg, processor, tokenizer, prompt, media, thinking=thinking
+        )
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
         do_sample = float(temperature) > 0.0
@@ -884,10 +913,17 @@ class ModelManager:
         duration = time.time() - started
 
         prompt_len = inputs["input_ids"].shape[1]
+        generated = outputs[0][prompt_len:]
         decoder = processor if processor is not None else tokenizer
-        response = decoder.decode(
-            outputs[0][prompt_len:], skip_special_tokens=True
-        ).strip()
+        response = decoder.decode(generated, skip_special_tokens=True).strip()
+
+        # Whether the answer ended or merely ran out of room is not cosmetic:
+        # it is the difference between "the model judged that enough" and "the
+        # model was cut off mid-sentence", and the two say opposite things
+        # about the model's quality. Nothing in the returned text distinguishes
+        # them, so it has to be measured here.
+        if self._hit_token_ceiling(generated, model, processor, tokenizer, max_tokens):
+            self._notice(self._truncation_advice(generated, decoder, thinking))
 
         out_path = self._output_path("text", seed, "txt")
         with open(out_path, "w", encoding="utf-8") as handle:
@@ -904,13 +940,130 @@ class ModelManager:
                 "seed": int(seed),
                 "images": 1 if image is not None else 0,
                 "video_frames": max(0, len(media) - (1 if image is not None else 0)),
+                "thinking": self._thinking_key(thinking),
             },
             duration,
             out_path,
         )
         return response, out_path, duration
 
+    # -- answer completeness -----------------------------------------------
+
+    @staticmethod
+    def _eos_ids(model: Any, processor: Any, tokenizer: Any) -> set:
+        """Every token id that legitimately ends a generation, from any source.
+
+        ``generation_config.eos_token_id`` may be an int, a list, or absent;
+        chat models routinely stop on ``<|im_end|>`` rather than the tokenizer's
+        nominal EOS, and only the generation config knows that.
+        """
+        ids: set = set()
+        sources = [
+            getattr(model, "generation_config", None),
+            getattr(model, "config", None),
+            tokenizer,
+            getattr(processor, "tokenizer", None),
+        ]
+        for source in sources:
+            value = getattr(source, "eos_token_id", None)
+            if value is None:
+                continue
+            for item in value if isinstance(value, (list, tuple, set)) else [value]:
+                try:
+                    ids.add(int(item))
+                except (TypeError, ValueError):
+                    continue
+        return ids
+
+    @classmethod
+    def _hit_token_ceiling(
+        cls, generated: Any, model: Any, processor: Any, tokenizer: Any, max_tokens: int
+    ) -> bool:
+        """True when generation stopped because it ran out of budget.
+
+        Deliberately conservative, and both halves matter. Length alone would
+        flag a model that stopped naturally on its very last allowed token; a
+        missing EOS alone would flag every early stop on a stop-string. Only
+        the conjunction means "there was more to say".
+        """
+        try:
+            length = int(generated.shape[-1])
+            last = int(generated[-1])
+        except Exception:  # noqa: BLE001 - never let a diagnostic break a good run
+            return False
+        if length < int(max_tokens):
+            return False
+        eos_ids = cls._eos_ids(model, processor, tokenizer)
+        return not (eos_ids and last in eos_ids)
+
+    @staticmethod
+    def _truncation_advice(generated: Any, decoder: Any, thinking: Optional[str]) -> str:
+        """Name the fix, not just the symptom.
+
+        Running out of budget *inside* the reasoning block is a different
+        problem from running out while writing the answer: the first is solved
+        by spending fewer tokens on reasoning, the second by raising the limit.
+        Decoding without ``skip_special_tokens`` is what makes the two
+        distinguishable — ``<think>`` and ``</think>`` are special tokens and
+        the user-facing decode drops them.
+        """
+        advice = (
+            "The answer hit the max-tokens limit and did not finish. "
+            "Raise 'Max new tokens'"
+        )
+        try:
+            raw = decoder.decode(generated, skip_special_tokens=False)
+        except Exception:  # noqa: BLE001
+            return advice + "."
+        if "<think>" in raw and "</think>" not in raw:
+            if thinking in (None, "deep", "standard"):
+                return (
+                    "The whole budget went into reasoning — the model never "
+                    "reached the answer. Switch 'Reasoning' to 'Brief' or "
+                    "'Off', or raise 'Max new tokens'."
+                )
+            return (
+                "The whole budget went into reasoning — the model never reached "
+                "the answer. Raise 'Max new tokens'."
+            )
+        return advice + " to let it finish."
+
     # -- LLM input assembly ------------------------------------------------
+
+    @staticmethod
+    def _thinking_key(thinking: Optional[str]) -> str:
+        """Normalise a UI choice to a key of ``THINKING_MODES``."""
+        key = str(thinking or DEFAULT_THINKING).strip().lower()
+        return key if key in THINKING_MODES else DEFAULT_THINKING
+
+    @staticmethod
+    def _apply_template(
+        apply: Callable[..., Any],
+        messages: List[Dict[str, Any]],
+        template_kwargs: Dict[str, Any],
+        **fixed: Any,
+    ) -> Any:
+        """Apply a chat template, degrading if it does not know the extra flags.
+
+        ``enable_thinking`` and ``reasoning_effort`` are read by the default
+        model's template. The fallback model's is a different file that has
+        never heard of them, and a Jinja template is free to ``raise_exception``
+        on anything it does not expect — so a reasoning preset must not be able
+        to take down a model that simply has no reasoning mode. Retrying
+        without them keeps the fallback working on exactly the prompt it would
+        have received before this feature existed.
+        """
+        try:
+            return apply(messages, **fixed, **template_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            if not template_kwargs:
+                raise
+            LOGGER.info(
+                "chat template rejected %s (%s); retrying without a reasoning preset",
+                sorted(template_kwargs),
+                exc,
+            )
+            return apply(messages, **fixed)
 
     def _build_llm_inputs(
         self,
@@ -919,8 +1072,12 @@ class ModelManager:
         tokenizer: Any,
         prompt: str,
         media: List[Image.Image],
+        thinking: Optional[str] = None,
     ) -> Dict[str, Any]:
         system_prompt = cfg.get("system_prompt") or ""
+        template_kwargs = dict(
+            THINKING_MODES[self._thinking_key(thinking or cfg.get("default_thinking"))]
+        )
 
         if processor is not None:
             content: List[Dict[str, Any]] = [
@@ -934,8 +1091,10 @@ class ModelManager:
                 )
             messages.append({"role": "user", "content": content})
             try:
-                return processor.apply_chat_template(
+                return self._apply_template(
+                    processor.apply_chat_template,
                     messages,
+                    template_kwargs,
                     add_generation_prompt=True,
                     tokenize=True,
                     return_dict=True,
@@ -955,8 +1114,12 @@ class ModelManager:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
         try:
-            text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+            text = self._apply_template(
+                tokenizer.apply_chat_template,
+                messages,
+                template_kwargs,
+                tokenize=False,
+                add_generation_prompt=True,
             )
         except Exception:  # noqa: BLE001
             text = f"System: {system_prompt}\nUser: {prompt}\nAssistant:"
