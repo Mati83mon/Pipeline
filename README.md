@@ -14,6 +14,7 @@ tags:
   - text-to-image
   - text-to-video
   - image-text-to-text
+  - audio-video-generation
   - zerogpu
   - not-for-all-audiences
 models:
@@ -21,17 +22,21 @@ models:
   - Lightricks/LTX-Video
   - orcarouter/Qwen3.8-27B-Uncensored-FP8
   - Qwen/Qwen3-VL-8B-Instruct
+  - MiniMaxAI/MiniMax-H3
+  - larryvrh/MiniMax-H3-Turbo-Lora
 ---
 
 # AI Media Pipeline
 
-Three generative modules behind one Gradio UI, with exactly one model resident
-at a time so they fit inside a single GPU allocation.
+Three local generative modules behind one Gradio UI, with exactly one model
+resident at a time so they fit inside a single GPU allocation — plus one engine
+that runs on a Space of its own.
 
 | Tab | Model | Pipeline | On disk |
 |---|---|---|---|
-| **Image** | [`lodestones/Chroma1-HD`](https://huggingface.co/lodestones/Chroma1-HD) | `ChromaPipeline` | ~28 GB |
+| **Photo** | [`lodestones/Chroma1-HD`](https://huggingface.co/lodestones/Chroma1-HD) | `ChromaPipeline` | ~28 GB |
 | **Video** | [`Lightricks/LTX-Video`](https://huggingface.co/Lightricks/LTX-Video) | `LTXPipeline` / `LTXImageToVideoPipeline` | ~27 GB |
+| **Video** | [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) — video **with audio** | remote Gradio API | **0 GB** |
 | **Text** | [`orcarouter/Qwen3.8-27B-Uncensored-FP8`](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-FP8) → fallback [`Qwen/Qwen3-VL-8B-Instruct`](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct) | `AutoModelForImageTextToText` | ~31 GB / ~18 GB |
 
 > This Space is configured to run uncensored models. Everything it produces is
@@ -93,6 +98,73 @@ not: **`kernels`**. `transformers` implements no FP8 matmul itself — every FP8
 layer loads a Triton kernel from the Hub through that package — so without it
 the 27B checkpoint loads perfectly and then fails on the first forward pass,
 inside the GPU allocation. The Text tab warns at load time if it is missing.
+
+## Video + audio (MiniMax-H3)
+
+The Video tab has two engines. **LTX-Video** is the local one: fast, silent,
+any resolution. **MiniMax-H3** produces video and a matching soundtrack from a
+single denoising pass — and runs on a *different* Space, which this one calls
+over its Gradio API.
+
+That split is not a preference. MiniMax-H3 cannot be loaded here for three
+independent reasons, none of which more pins would fix:
+
+| | |
+|---|---|
+| **Disk** | 195.9 GiB in bfloat16 against a ZeroGPU Space's 150 GB storage ceiling. Upstream therefore splits it into a 77.3 GB denoiser and a 66.7 GB Qwen3-VL conditioner. This Space already carries ~86 GB; the denoising *half* alone does not fit beside it. |
+| **Dependencies** | The denoiser pins `transformers==5.8.0` and installs `diffusers` from an unmerged PR. Its own `requirements.txt` records that the `kernels` release FP8 attention wants "breaks transformers 5.8.0 at import" — and our 27B FP8 text model **requires** `kernels>=0.16`. No version of either package satisfies both. |
+| **Allocation** | It needs `size="xlarge"`; upstream states `large` does not fit. This Space runs `large`, and an xlarge second costs 2× quota. |
+
+So nothing of it is downloaded here, no local GPU is booked for it, and
+`requirements.txt` is unchanged. See `pipeline/remote.py` and docs/AUDIT.md
+section G.
+
+### Setting it up
+
+It works out of the box against the upstream Space. For anything you rely on,
+point it at your own copy instead — the default is someone else's queue and can
+change or go private without notice:
+
+1. **Duplicate** [`Pepe104/MiniMax-H3-Turbo-Lora-UNCENSORED`](https://huggingface.co/spaces/Pepe104/MiniMax-H3-Turbo-Lora-UNCENSORED).
+   No secrets are needed; every weight it downloads is public.
+2. Set its hardware to **ZeroGPU** and its `H3_GPU_SIZE` variable to `xlarge`.
+3. Put `owner/name` in `video.remote_engine.space_id` here.
+
+Its conditioner half (`multimodalart/qwen3vl-conditioner`) must also be awake.
+Duplicate that too and set `H3_CONDITIONER` on your copy if you do not want to
+depend on someone else's Space staying up.
+
+Leave `send_hf_token` at `false` for any Space you do not own. `HF_TOKEN` here
+is a read credential for the gated text model; attaching it to requests would
+hand it to whoever runs the target Space, and buys nothing — the default target
+is public.
+
+### Length, and what it costs
+
+| Slider | Frames | Actual output | GPU booked |
+|---|---|---|---|
+| 5 s, fast canvas | 124 | 5.17 s | ~73 s |
+| 10 s, 9:16 full, 1 keyframe | 243 | 10.13 s | ~271 s |
+| **14 s, 16:9 full, 1 keyframe** | 345 | **14.38 s** | ~440 s |
+
+**14 seconds is the ceiling, and it is the checkpoint's, not the UI's.** At
+24 fps the video VAE decodes `17n + 5` frames only, so a request is snapped up
+to the next such count — and 15 s (360 frames) snaps to 362, i.e. 15.083 s,
+which the pipeline refuses outright. 14 s snaps to 345 and lands. The slider
+stops at 14 so it cannot offer a guaranteed failure.
+
+Two consequences worth knowing before you spend quota:
+
+- Cost grows **quadratically** with the canvas, because the model attends over
+  the whole packed sequence in every layer. A 14 s clip at the full canvas is
+  roughly six times a 5 s clip at the fast one, and the remote Space books
+  `xlarge`, where each second costs two of quota. The **This request** readout
+  prices every change before you click.
+- Two cards are booked per render — the denoiser's and its conditioner's — and
+  both are billed to whoever clicked, via the `x-ip-token` header this Space
+  forwards. Without that forwarding the bookings fall back to the remote
+  Space's pod quota, which is too small to grant them, so the symptom is a
+  queue that never clears rather than a larger bill.
 
 ## Reasoning modes (Text tab)
 
@@ -170,11 +242,18 @@ with small token budgets; image and video generation are not practical.
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q          # 151 tests, no torch or GPU required
+python -m pytest tests/ -q          # 204 tests, no torch or GPU required
 ```
 
 They cover config validation, LTX frame/resolution alignment, seed handling,
 log rotation, frame normalisation and the full UI build.
+
+For the remote video engine they also pin the things whose failure is silent: a
+transcription of the upstream cost formula that our port is compared against
+over 720 parameter combinations, the `17n + 5` frame snapping that decides what
+duration a request really returns, that `x-ip-token` is forwarded and `HF_TOKEN`
+is not, that a rejected request never reaches the network, and — from the parse
+tree, not the text — that nothing in `pipeline/remote.py` books a local GPU.
 
 Some of them guard this file. `sdk_version` here and the `gradio` pin in
 `requirements.txt` must agree — otherwise the Space builds one Gradio and
@@ -201,6 +280,7 @@ pipeline/
 ├── config.py           Schema validation
 ├── runtime.py          ZeroGPU shim, dtype/VRAM probing, disk budgeting
 ├── models.py           ModelManager: load, evict, generate
+├── remote.py           MiniMax-H3 over another Space's API (no local GPU)
 ├── media.py            Video encode/decode, output pruning
 └── history.py          Bounded JSONL run log
 tests/test_pipeline.py  Test suite
@@ -221,6 +301,10 @@ docs/DEPLOY.md          Deployment and troubleshooting
 | Black or empty image | Almost always `fp16` on a T5 encoder. Set `dtype` back to `bfloat16`. |
 | First run takes many minutes | Expected: the model is downloading. Watch the Space logs. |
 | `ChromaPipeline` not found | `diffusers` is older than 0.35. Reinstall from `requirements.txt`. |
+| MiniMax-H3 says "still loading" | The remote Space downloads 77.3 GB on a cold start. Give it a few minutes. |
+| MiniMax-H3 render never starts | Almost always the quota attribution: open the Space in a browser tab rather than driving it through a script, so an `x-ip-token` exists to forward. **Refresh status** reports whether the remote Space was reached. |
+| "not a canvas … accepts" | Upstream renamed a canvas. **Refresh status** names the difference; update `video.remote_engine.canvases`. |
+| Clip is shorter than the slider said | Expected. Frames snap to `17n + 5` at 24 fps, so 13 s and 13.5 s both return 13.67 s. The **This request** box shows what you will actually get. |
 
 ## Licence
 

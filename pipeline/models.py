@@ -1176,6 +1176,34 @@ class ModelManager:
         name = f"{kind}_{stamp}_{int(seed)}.{extension}"
         return os.path.join(self.output_dir, name)
 
+    def log_external_run(
+        self,
+        kind: str,
+        prompt: str,
+        params: Dict[str, Any],
+        duration: float,
+        out_path: str,
+        model_id: str,
+    ) -> None:
+        """Record a run this manager did not perform, and prune as usual.
+
+        The remote video engine produces a file in this Space's output
+        directory without ever loading a model here, so it has no
+        ``LoadedModel`` to hand ``_finish``. Without this it would be the one
+        output that never reaches History and never gets pruned — the
+        ``keep_outputs`` cap would quietly stop holding.
+        """
+        self.logger.log(
+            gen_type=kind,
+            prompt=prompt,
+            params=params,
+            duration=duration,
+            output_path=out_path,
+            model_id=model_id,
+            fallback=False,
+        )
+        prune_directory(self.output_dir, int(self.system.get("keep_outputs", 40)))
+
     def _finish(
         self,
         loaded: LoadedModel,

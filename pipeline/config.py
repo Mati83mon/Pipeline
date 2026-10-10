@@ -87,6 +87,17 @@ class AppConfig:
         return self.section("llm")
 
     @property
+    def video_remote(self) -> Dict[str, Any]:
+        """The optional remote video engine block. ``{}`` when absent."""
+        block = self.video.get("remote_engine")
+        return block if isinstance(block, dict) else {}
+
+    @property
+    def remote_video_enabled(self) -> bool:
+        block = self.video_remote
+        return bool(block.get("enabled")) and bool(str(block.get("space_id", "")).strip())
+
+    @property
     def system(self) -> Dict[str, Any]:
         return self.section("system")
 
@@ -124,6 +135,78 @@ def _validate(raw: Dict[str, Any], path: str) -> None:
         lo, hi = block.get("min_steps"), block.get("max_steps")
         if lo is not None and hi is not None and lo > hi:
             raise ConfigError(f"{path}: '{section}.min_steps' exceeds 'max_steps'")
+
+    _validate_remote_engine(raw["video"].get("remote_engine"), path)
+
+
+def _validate_remote_engine(block: Any, path: str) -> None:
+    """Check the remote video engine block, when one is configured and on.
+
+    The whole reason this file exists is that a typo should not surface as a
+    ``KeyError`` at click time, and this block is the worst candidate for that:
+    a wrong canvas label or a missing ``space_id`` does not fail here, it fails
+    minutes later as an opaque error raised by a Space the user does not run.
+    """
+    where = "video.remote_engine"
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise ConfigError(f"{path}: '{where}' must be an object")
+    if not block.get("enabled"):
+        return
+
+    space_id = block.get("space_id")
+    if not isinstance(space_id, str) or space_id.count("/") != 1 or not all(
+        part.strip() for part in space_id.split("/")
+    ):
+        raise ConfigError(
+            f"{path}: '{where}.space_id' must be 'owner/name', got {space_id!r}"
+        )
+
+    canvases = block.get("canvases")
+    if not isinstance(canvases, list) or not canvases:
+        raise ConfigError(f"{path}: '{where}.canvases' must be a non-empty list")
+    if not all(isinstance(item, str) and item.strip() for item in canvases):
+        raise ConfigError(f"{path}: '{where}.canvases' must hold non-empty strings")
+
+    default_canvas = block.get("default_canvas")
+    if default_canvas is not None and default_canvas not in canvases:
+        raise ConfigError(
+            f"{path}: '{where}.default_canvas' ({default_canvas!r}) is not in "
+            f"'{where}.canvases'"
+        )
+
+    lo, hi = block.get("min_duration"), block.get("max_duration")
+    for key, value in (("min_duration", lo), ("max_duration", hi)):
+        if value is not None and not isinstance(value, (int, float)):
+            raise ConfigError(f"{path}: '{where}.{key}' must be a number")
+    if lo is not None and hi is not None and lo > hi:
+        raise ConfigError(f"{path}: '{where}.min_duration' exceeds 'max_duration'")
+
+    default_duration = block.get("default_duration")
+    if default_duration is not None:
+        if not isinstance(default_duration, (int, float)):
+            raise ConfigError(f"{path}: '{where}.default_duration' must be a number")
+        if lo is not None and hi is not None and not lo <= default_duration <= hi:
+            raise ConfigError(
+                f"{path}: '{where}.default_duration' ({default_duration}) is "
+                f"outside {lo}..{hi}"
+            )
+
+    loras = block.get("loras")
+    if loras is not None:
+        if not isinstance(loras, dict) or not loras:
+            raise ConfigError(f"{path}: '{where}.loras' must be a non-empty object")
+        if not all(isinstance(v, int) for v in loras.values()):
+            raise ConfigError(
+                f"{path}: '{where}.loras' must map a name to its step count (int)"
+            )
+        default_lora = block.get("default_lora")
+        if default_lora is not None and default_lora not in loras:
+            raise ConfigError(
+                f"{path}: '{where}.default_lora' ({default_lora!r}) is not in "
+                f"'{where}.loras'"
+            )
 
 
 def load_config(path: str | os.PathLike[str] = DEFAULT_CONFIG_PATH) -> AppConfig:
