@@ -1297,3 +1297,568 @@ def test_every_gpu_task_converts_before_the_boundary(
     with pytest.raises(gr.Error) as caught:
         getattr(app_module, task)(*[None] * arity)
     assert "a diagnosis worth keeping" in str(caught.value)
+
+
+# ---------------------------------------------------------------------------
+# Remote video engine — MiniMax-H3 on another Space
+# ---------------------------------------------------------------------------
+
+
+class _RecordingClient:
+    """Stands in for `gradio_client.Client`, recording how it was built and called."""
+
+    instances: list = []
+
+    def __init__(self, src, **kwargs):
+        self.src = src
+        self.kwargs = kwargs
+        self.calls = []
+        self.result = (None, "remote report", "")
+        _RecordingClient.instances.append(self)
+
+    def predict(self, *args, **kwargs):
+        self.calls.append(kwargs)
+        return self.result
+
+
+def _fake_gradio_client(monkeypatch, video_path=None):
+    """Install a stub `gradio_client` and return the module.
+
+    `remote.py` imports it inside the methods that need it, which is what makes
+    this possible without the real package — and is also why the production
+    import failure has its own message.
+    """
+    import types
+
+    _RecordingClient.instances = []
+    module = types.ModuleType("gradio_client")
+    module.Client = _RecordingClient
+    module.handle_file = lambda path: {"path": path, "meta": {"_type": "gradio.FileData"}}
+    monkeypatch.setitem(sys.modules, "gradio_client", module)
+    if video_path is not None:
+        _RecordingClient.result_path = str(video_path)
+    return module
+
+
+@pytest.fixture
+def remote_engine(tmp_path):
+    from pipeline.remote import RemoteVideoEngine
+
+    config = load_config(REPO_ROOT / "config.json")
+    return RemoteVideoEngine(config.video_remote, output_dir=str(tmp_path / "outputs"))
+
+
+# -- the ported cost model -------------------------------------------------
+
+
+def _upstream_duration(image, last_image, height, width, num_frames, steps):
+    """`get_duration` transcribed from the remote Space's own `app.py`.
+
+    An independent copy on purpose. It is the control for our port: edit the
+    coefficients in `pipeline.remote` and the grid test below fails, which is
+    the only way a silently wrong quota estimate gets caught — the UI prints
+    the number with confidence either way.
+    """
+    frames_per_chunk, latents_per_chunk = 17, 5
+    dur_b, dur_c = 1.1745e-4, 3.8396e-9
+    decode_base, decode_per_canvas = 15, 15
+    default_canvas_pixels = 960 * 544 * 124
+    placement_allowance, pad = 12, 10
+
+    height, width, num_frames, steps = int(height), int(width), int(num_frames), int(steps)
+    latent_frames = (num_frames - latents_per_chunk) // frames_per_chunk * latents_per_chunk + 2
+    patches = (height // 32) * (width // 32)
+    rows = latent_frames * patches + (int(image is not None) + int(last_image is not None)) * patches
+    denoise = steps * (dur_b * rows + dur_c * rows**2)
+    decode = decode_base + decode_per_canvas * (height * width * num_frames) / default_canvas_pixels
+    return max(60, int(denoise + decode) + placement_allowance + pad)
+
+
+def test_ported_cost_model_matches_the_remote_formula():
+    from pipeline.remote import CANVASES, estimate_gpu_seconds, snap_frames
+
+    for label, (height, width) in CANVASES.items():
+        for seconds in (2, 2.5, 5, 10, 14):
+            for steps in (4, 6, 28):
+                for keyframes in (0, 1, 2):
+                    expected = _upstream_duration(
+                        object() if keyframes >= 1 else None,
+                        object() if keyframes >= 2 else None,
+                        height,
+                        width,
+                        snap_frames(seconds),
+                        steps,
+                    )
+                    assert (
+                        estimate_gpu_seconds(label, seconds, steps, keyframes) == expected
+                    ), f"{label} {seconds}s {steps} steps {keyframes} keyframes"
+
+
+@pytest.mark.parametrize(
+    "canvas,seconds,steps,keyframes,expected",
+    [
+        ("960x544 · 16:9 fast", 5, 6, 0, 73),
+        # The floor: nothing is booked for less than 60 s.
+        ("960x544 · 16:9 fast", 2, 4, 0, 60),
+        ("768x1344 · 9:16 full", 10, 6, 1, 271),
+        # The longest clip this tab can ask for, at the widest canvas.
+        ("1344x768 · 16:9 full", 14, 6, 1, 440),
+        # Undistilled base model: 28 steps instead of 6, and it shows.
+        ("1536x672 · 21:9 full", 10, 28, 0, 900),
+    ],
+)
+def test_cost_model_absolute_values_are_pinned(canvas, seconds, steps, keyframes, expected):
+    """Pinned so editing both our port and the transcription still fails."""
+    from pipeline.remote import estimate_gpu_seconds
+
+    assert estimate_gpu_seconds(canvas, seconds, steps, keyframes) == expected
+
+
+@pytest.mark.parametrize(
+    "seconds,frames",
+    [(2, 56), (5, 124), (10, 243), (13, 328), (13.5, 328), (14, 345)],
+)
+def test_frame_snapping_matches_the_video_vae(seconds, frames):
+    """The decodable counts are `17n + 5` at 24 fps, nothing else."""
+    from pipeline.remote import snap_frames
+
+    assert snap_frames(seconds) == frames
+    assert frames % 17 == 5
+
+
+def test_fourteen_seconds_is_the_real_ceiling(remote_engine):
+    """Why `max_duration` is 14 and not 15.
+
+    15 s is 360 frames, which snaps to 362 — 15.083 s — past the duration the
+    pipeline accepts, so the request is refused rather than truncated. 14 s
+    snaps to 345 (14.375 s) and lands. A slider that offered 15 would hand the
+    user a guaranteed failure.
+    """
+    from pipeline.remote import snap_frames
+
+    low, high = remote_engine.duration_bounds()
+    assert (low, high) == (2.0, 14.0)
+    assert snap_frames(high) / 24 <= 15.0
+    assert snap_frames(high + 0.5) / 24 > 15.0
+
+
+# -- config --------------------------------------------------------------
+
+
+def test_shipped_config_enables_the_remote_engine():
+    config = load_config(REPO_ROOT / "config.json")
+    assert config.remote_video_enabled
+    block = config.video_remote
+    assert block["space_id"].count("/") == 1
+    assert block["max_duration"] == 14
+    assert block["default_lora"] in block["loras"]
+
+
+def test_config_canvas_table_matches_the_module():
+    """Two copies of the same labels; neither may drift from the other.
+
+    The label is matched by string on the far side, so a typo here is a request
+    that fails inside a conditioner Space the user has never heard of.
+    """
+    from pipeline.remote import CANVASES
+
+    config = load_config(REPO_ROOT / "config.json")
+    assert config.video_remote["canvases"] == list(CANVASES)
+    # The separator upstream uses, and the one a lookup will be matched against.
+    assert all("·" in label for label in CANVASES)
+
+
+def _remote_config(tmp_path, **overrides):
+    raw = json.loads((REPO_ROOT / "config.json").read_text(encoding="utf-8"))
+    raw["video"]["remote_engine"].update(overrides)
+    broken = tmp_path / "config.json"
+    broken.write_text(json.dumps(raw), encoding="utf-8")
+    return broken
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"space_id": "no-slash"}, "must be 'owner/name'"),
+        ({"space_id": "owner/"}, "must be 'owner/name'"),
+        ({"canvases": []}, "non-empty list"),
+        ({"default_canvas": "640x480 · nope"}, "is not in"),
+        ({"min_duration": 20}, "exceeds 'max_duration'"),
+        ({"default_duration": 99}, "outside"),
+        ({"default_lora": "nonexistent"}, "is not in"),
+        ({"loras": {"larry": "six"}}, "step count"),
+    ],
+)
+def test_remote_engine_config_is_validated(tmp_path, overrides, message):
+    with pytest.raises(ConfigError, match=message):
+        load_config(_remote_config(tmp_path, **overrides))
+
+
+def test_disabled_remote_engine_skips_validation(tmp_path):
+    """A block that is off must not be able to stop the Space from booting."""
+    path = _remote_config(tmp_path, enabled=False, space_id="broken", canvases=[])
+    config = load_config(path)
+    assert not config.remote_video_enabled
+
+
+def test_absent_remote_engine_is_fine(tmp_path):
+    raw = json.loads((REPO_ROOT / "config.json").read_text(encoding="utf-8"))
+    del raw["video"]["remote_engine"]
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    config = load_config(path)
+    assert config.video_remote == {}
+    assert not config.remote_video_enabled
+
+
+# -- the call itself -----------------------------------------------------
+
+
+def _generate(engine, tmp_path, **kwargs):
+    produced = tmp_path / "remote.mp4"
+    produced.write_bytes(b"\x00mp4")
+    _RecordingClient.instances = []
+    defaults = dict(prompt="a cat on a skateboard", duration=5, steps=6, seed=7)
+    defaults.update(kwargs)
+
+    original_init = _RecordingClient.__init__
+
+    def init(self, src, **client_kwargs):
+        original_init(self, src, **client_kwargs)
+        self.result = (str(produced), "1344x768 · 345 frames", "")
+
+    _RecordingClient.__init__ = init
+    try:
+        return engine.generate(**defaults)
+    finally:
+        _RecordingClient.__init__ = original_init
+
+
+def test_ip_token_is_forwarded_so_the_caller_pays(remote_engine, tmp_path, monkeypatch):
+    """The one header this integration cannot work without.
+
+    ZeroGPU bills a booking to whatever `x-ip-token` identifies. Drop it and
+    both bookings — the denoiser's and its conditioner's — land on this Space's
+    pod IP, where an unattributed caller may hold 120 credits and an xlarge
+    second costs two. A render of any useful length can never be granted one,
+    so the symptom is not a bigger bill but a queue that never clears.
+    """
+    _fake_gradio_client(monkeypatch)
+    _generate(remote_engine, tmp_path, ip_token="tok-abc")
+    call = _RecordingClient.instances[0].calls[0]
+    assert call["headers"] == {"x-ip-token": "tok-abc"}
+
+
+def test_no_ip_token_sends_no_header(remote_engine, tmp_path, monkeypatch):
+    _fake_gradio_client(monkeypatch)
+    _generate(remote_engine, tmp_path, ip_token=None)
+    assert _RecordingClient.instances[0].calls[0]["headers"] is None
+
+
+def test_hf_token_is_not_sent_to_a_space_we_do_not_own(
+    remote_engine, tmp_path, monkeypatch
+):
+    """A read credential for a gated model must not leak to a third party.
+
+    The default `space_id` belongs to someone else. Attaching `HF_TOKEN` to its
+    requests would hand our token to whoever runs it, and buy nothing: the
+    default target is public.
+    """
+    monkeypatch.setenv("HF_TOKEN", "hf_secret_value")
+    _fake_gradio_client(monkeypatch)
+    _generate(remote_engine, tmp_path)
+    built = _RecordingClient.instances[0]
+    assert built.kwargs["token"] is None
+    assert "hf_secret_value" not in repr(built.kwargs)
+
+
+def test_hf_token_is_sent_only_when_the_config_opts_in(tmp_path, monkeypatch):
+    from pipeline.remote import RemoteVideoEngine
+
+    monkeypatch.setenv("HF_TOKEN", "hf_secret_value")
+    _fake_gradio_client(monkeypatch)
+    config = load_config(REPO_ROOT / "config.json")
+    block = dict(config.video_remote)
+    block["send_hf_token"] = True
+    engine = RemoteVideoEngine(block, output_dir=str(tmp_path / "outputs"))
+    _generate(engine, tmp_path)
+    assert _RecordingClient.instances[0].kwargs["token"] == "hf_secret_value"
+
+
+def test_generate_sends_the_parameters_the_endpoint_declares(
+    remote_engine, tmp_path, monkeypatch
+):
+    _fake_gradio_client(monkeypatch)
+    _generate(
+        remote_engine,
+        tmp_path,
+        canvas="1344x768 · 16:9 full",
+        duration=10,
+        steps=4,
+        lora="lightx",
+        upsample=True,
+        seed=99,
+    )
+    call = _RecordingClient.instances[0].calls[0]
+    assert call["api_name"] == "/generate"
+    assert call["canvas"] == "1344x768 · 16:9 full"
+    assert call["duration"] == 10.0
+    assert call["steps"] == 4
+    assert call["lora"] == "lightx"
+    assert call["upsample"] is True
+    assert call["seed"] == 99
+    # Every input the remote signature declares, and nothing it does not.
+    assert set(call) == {
+        "prompt", "image_path", "last_image_path", "canvas", "duration",
+        "steps", "seed", "upsample", "lora", "api_name", "headers",
+    }
+
+
+def test_keyframes_travel_as_file_handles(remote_engine, tmp_path, monkeypatch):
+    _fake_gradio_client(monkeypatch)
+    first = tmp_path / "first.png"
+    first.write_bytes(b"\x89PNG")
+    _generate(remote_engine, tmp_path, image=str(first))
+    call = _RecordingClient.instances[0].calls[0]
+    assert call["image_path"]["path"] == str(first)
+    assert call["last_image_path"] is None
+
+
+def test_output_is_adopted_into_this_spaces_output_dir(
+    remote_engine, tmp_path, monkeypatch
+):
+    """Otherwise it is the one render History never shows and pruning never caps."""
+    _fake_gradio_client(monkeypatch)
+    path, _report, _refined, _elapsed = _generate(remote_engine, tmp_path, seed=4242)
+    assert Path(path).parent == Path(remote_engine.output_dir)
+    assert Path(path).name.startswith("video_h3_")
+    assert Path(path).name.endswith("_4242.mp4")
+    assert Path(path).read_bytes() == b"\x00mp4"
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"canvas": "640x480 · invented"}, "not a canvas"),
+        ({"duration": 15}, "checkpoint's ceiling"),
+        ({"duration": 0.5}, "between"),
+    ],
+)
+def test_rejected_requests_never_reach_the_network(
+    remote_engine, tmp_path, monkeypatch, overrides, message
+):
+    """Validate locally, so a doomed request costs nothing and says why."""
+    from pipeline.remote import RemoteEngineError
+
+    _fake_gradio_client(monkeypatch)
+    with pytest.raises(RemoteEngineError, match=message):
+        _generate(remote_engine, tmp_path, **overrides)
+    assert _RecordingClient.instances == []
+
+
+def test_disabled_engine_refuses_with_an_actionable_message(tmp_path):
+    from pipeline.remote import RemoteEngineError, RemoteVideoEngine
+
+    engine = RemoteVideoEngine({"enabled": False}, output_dir=str(tmp_path))
+    with pytest.raises(RemoteEngineError, match="config.json"):
+        engine.generate(prompt="x")
+
+
+@pytest.mark.parametrize(
+    "result,expected",
+    [
+        (("/v.mp4", "report", "refined"), ("/v.mp4", "report", "refined")),
+        (["/v.mp4", "report"], ("/v.mp4", "report", "")),
+        ({"path": "/v.mp4"}, ("/v.mp4", "", "")),
+        ("/v.mp4", ("/v.mp4", "", "")),
+        (("/v.mp4", "r", "x", "a fourth element"), ("/v.mp4", "r", "x")),
+    ],
+)
+def test_unpack_tolerates_the_shapes_the_endpoint_can_return(result, expected):
+    from pipeline.remote import RemoteVideoEngine
+
+    assert RemoteVideoEngine._unpack(result) == expected
+
+
+def test_unpack_rejects_an_empty_result():
+    from pipeline.remote import RemoteEngineError, RemoteVideoEngine
+
+    with pytest.raises(RemoteEngineError, match="no video"):
+        RemoteVideoEngine._unpack(("", "", ""))
+
+
+def test_remote_module_books_no_gpu():
+    """The premise of the whole design: this side allocates nothing.
+
+    A `@spaces.GPU` here would hold a local card for the length of a network
+    call to a Space that is itself already holding one — paying twice for one
+    render, on a quota charged by the second.
+
+    Checked against the parse tree rather than the text, because the module
+    explains this in prose and a substring search cannot tell the explanation
+    from the mistake.
+    """
+    import ast
+
+    tree = ast.parse((REPO_ROOT / "pipeline/remote.py").read_text(encoding="utf-8"))
+
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+            if node.module.endswith("runtime"):
+                imported.update(alias.name for alias in node.names)
+    assert "spaces" not in imported
+    assert "gpu_task" not in imported
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in node.decorator_list:
+                rendered = ast.unparse(decorator)
+                assert "spaces" not in rendered and "gpu" not in rendered.lower(), (
+                    f"{node.name} is decorated with {rendered}"
+                )
+
+
+# -- handler and UI wiring ------------------------------------------------
+
+
+def test_remote_handler_forwards_the_request_token(app_module, tmp_path, monkeypatch):
+    class _Request:
+        headers = {"x-ip-token": "tok-from-request"}
+
+    seen = {}
+
+    def _generate_stub(**kwargs):
+        seen.update(kwargs)
+        produced = tmp_path / "out.mp4"
+        produced.write_bytes(b"\x00")
+        return str(produced), "remote says so", "", 12.5
+
+    monkeypatch.setattr(app_module.REMOTE_VIDEO, "generate", _generate_stub)
+    monkeypatch.setattr(
+        app_module.MANAGER, "logger", GenerationLogger(str(tmp_path / "log.jsonl"))
+    )
+    path, info, *_ = app_module.handle_video_remote(
+        "a prompt", None, None, "960x544 · 16:9 fast", 5, 6, "larry", False,
+        7, False, _Request(),
+    )
+    assert seen["ip_token"] == "tok-from-request"
+    assert "remote says so" in info
+    assert Path(path).exists()
+
+
+def test_remote_handler_logs_to_history(app_module, tmp_path, monkeypatch):
+    """A remote render is a run like any other, or History lies about the Space."""
+    logger = GenerationLogger(str(tmp_path / "log.jsonl"))
+    monkeypatch.setattr(app_module.MANAGER, "logger", logger)
+    monkeypatch.setattr(app_module.MANAGER, "output_dir", str(tmp_path))
+
+    def _generate_stub(**kwargs):
+        produced = tmp_path / "out.mp4"
+        produced.write_bytes(b"\x00")
+        return str(produced), "", "", 3.0
+
+    monkeypatch.setattr(app_module.REMOTE_VIDEO, "generate", _generate_stub)
+    app_module.handle_video_remote(
+        "a prompt", None, None, "960x544 · 16:9 fast", 5, 6, "larry", False,
+        7, False, None,
+    )
+    entry = logger.history(limit=1)[0]
+    assert entry["type"] == "video"
+    assert entry["params"]["engine"] == "minimax_h3"
+    assert entry["params"]["attributed"] is False
+    assert entry["model_id"] == app_module.REMOTE_VIDEO.space_id
+
+
+def test_remote_handler_is_not_a_gpu_task(app_module):
+    """`gpu_task` wraps with functools.wraps, so a wrapped function shows it."""
+    assert not hasattr(app_module.handle_video_remote, "__wrapped__")
+    for name in ("_gpu_image", "_gpu_video", "_gpu_text"):
+        assert hasattr(getattr(app_module, name), "__wrapped__")
+
+
+def test_remote_event_gets_its_own_concurrency_lane():
+    """A six-minute network call must not sit in the one-model-resident queue.
+
+    `default_concurrency_limit=1` is correct for the local tabs and wrong here:
+    without a separate lane, one MiniMax render freezes image and text
+    generation for every user for its whole duration.
+    """
+    source = (REPO_ROOT / "app.py").read_text(encoding="utf-8")
+    h3_click = source.split('video_ui["h3_button"].click(')[1].split("))")[0]
+    assert 'concurrency_id="remote_video"' in h3_click
+    assert "concurrency_limit" in h3_click
+
+
+def test_video_tab_exposes_both_engines(app_module):
+    import gradio as gr
+
+    config = load_config(REPO_ROOT / "config.json")
+    with gr.Blocks():
+        built = app_module.ui.create_video_tab(config.video)
+    assert built["remote_enabled"] is True
+    for key in ("h3_canvas", "h3_duration", "h3_steps", "h3_lora", "h3_upsample"):
+        assert key in built
+    # The local controls survive untouched.
+    for key in ("negative", "width", "height", "frames", "fps", "guidance"):
+        assert key in built
+
+
+def test_video_tab_without_the_remote_engine_is_the_old_tab(app_module):
+    import gradio as gr
+
+    config = load_config(REPO_ROOT / "config.json")
+    block = dict(config.video)
+    block["remote_engine"] = {"enabled": False}
+    with gr.Blocks():
+        built = app_module.ui.create_video_tab(block)
+    assert built["remote_enabled"] is False
+    # The group and the button are structural and always built; what must not
+    # exist is any remote *control*, because app.py wires them by these names
+    # and a half-built tab would fail at startup rather than at click time.
+    for key in ("h3_canvas", "h3_duration", "h3_steps", "h3_lora", "h3_upsample",
+                "h3_first_image", "h3_last_image", "h3_cost"):
+        assert key not in built
+
+
+def test_engine_toggle_swaps_groups_and_buttons(app_module):
+    ltx_group, h3_group, ltx_button, h3_button = app_module.ui.toggle_video_engine(
+        app_module.ui.ENGINE_H3
+    )
+    assert h3_group["visible"] and h3_button["visible"]
+    assert not ltx_group["visible"] and not ltx_button["visible"]
+
+    ltx_group, h3_group, ltx_button, h3_button = app_module.ui.toggle_video_engine(
+        app_module.ui.ENGINE_LTX
+    )
+    assert ltx_group["visible"] and ltx_button["visible"]
+    assert not h3_group["visible"] and not h3_button["visible"]
+
+
+def test_request_readout_states_the_real_duration_and_cost(app_module):
+    """The slider says 14; the model renders 345 frames. Show what will happen."""
+    text = app_module.ui.describe_remote_request("1344x768 · 16:9 full", 14, 6, 0)
+    assert "345 frames" in text
+    assert "14.38 s of video" in text
+    assert "xlarge" in text
+
+
+def test_readme_documents_the_configured_remote_space(front_matter):
+    """Drift this project has already been bitten by: config says one thing,
+    README another. The space_id is the one value an operator will go looking
+    for in the docs before they look in the JSON."""
+    config = load_config(REPO_ROOT / "config.json")
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert config.video_remote["space_id"] in readme
+    # The model the remote Space runs belongs in the front matter like any other.
+    assert "MiniMaxAI/MiniMax-H3" in set(front_matter.get("models", []))
+
+
+def test_readme_states_the_real_duration_ceiling():
+    """A README promising 15 s would send people straight into the refusal."""
+    config = load_config(REPO_ROOT / "config.json")
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert f"{config.video_remote['max_duration']} seconds is the ceiling" in readme

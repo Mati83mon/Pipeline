@@ -12,6 +12,8 @@ from typing import Any, Dict
 
 import gradio as gr
 
+from pipeline.remote import FPS as REMOTE_FPS, estimate_gpu_seconds, snap_frames
+
 HISTORY_HEADERS = [
     "Time (UTC)",
     "Type",
@@ -53,6 +55,11 @@ TEXT_PRESETS: Dict[str, Dict[str, Any]] = {
 }
 CUSTOM_PRESET = "Custom"
 
+# The two engines behind the Video tab. The values are what `handle_video`
+# dispatches on, so they are part of the contract between this file and app.py.
+ENGINE_LTX = "ltx"
+ENGINE_H3 = "minimax_h3"
+
 
 def _seed_row() -> tuple[gr.Number, gr.Checkbox]:
     with gr.Row():
@@ -82,7 +89,9 @@ def disabled_tab(name: str, module: str) -> None:
 
 
 def create_image_tab(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    with gr.TabItem("Image"):
+    # Labelled "Photo"; the config section, the manager's module key and this
+    # builder's name stay "image", which is what every other file calls it.
+    with gr.TabItem("Photo"):
         gr.Markdown(
             f"**{cfg['model_id']}** · text-to-image. "
             f"Width and height are rounded down to multiples of "
@@ -125,60 +134,219 @@ def create_image_tab(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def create_video_tab(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    with gr.TabItem("Video"):
-        gr.Markdown(
-            f"**{cfg['model_id']}** · text-to-video and image-to-video. "
-            f"Resolution snaps to multiples of {cfg.get('size_step', 32)}, "
-            f"frame count to 8n+1. Attach an image to drive image-to-video."
+def describe_remote_request(canvas: str, duration: float, steps: int, keyframes: int) -> str:
+    """What this MiniMax-H3 request will actually cost, before the click.
+
+    Worth its own readout because two of the three numbers are surprising. The
+    duration is not what the slider says — the video VAE decodes ``17n + 5``
+    frames at 24 fps, so the request is snapped up. And the GPU seconds grow
+    quadratically with the canvas, because the model attends over the whole
+    packed sequence every layer: 5 s at the fast canvas is about a minute,
+    14 s at the full one is several hundred seconds, and the remote Space books
+    ``xlarge``, where every second costs two of quota.
+    """
+    frames = snap_frames(duration)
+    seconds = estimate_gpu_seconds(canvas, duration, steps, keyframes)
+    return (
+        f"{frames} frames · {frames / REMOTE_FPS:.2f} s of video · "
+        f"~{seconds} s of GPU booked (xlarge, so ~{seconds * 2} s of quota)"
+    )
+
+
+def _remote_video_group(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """The MiniMax-H3 controls. No negative prompt: it is guidance-distilled."""
+    from pipeline.remote import RemoteVideoEngine
+
+    engine = RemoteVideoEngine(cfg)
+    canvases = engine.canvases()
+    default_canvas = engine.default_canvas()
+    low, high = engine.duration_bounds()
+    loras = engine.loras()
+    default_lora = cfg.get("default_lora") if cfg.get("default_lora") in loras else next(iter(loras))
+    default_steps = loras[default_lora]
+    default_duration = float(cfg.get("default_duration", min(high, 5)))
+
+    gr.Markdown(
+        f"**{cfg.get('space_id', '—')}** · runs on a separate Space, so none of "
+        f"its 77.3 GB touches this one. Audio is generated with the video in one "
+        f"pass. No negative prompt — the model is guidance-distilled. "
+        f"**{high:g} s is the hard ceiling**, set by the checkpoint."
+    )
+    with gr.Row():
+        first_image = gr.Image(
+            label="First keyframe (optional)", type="filepath",
+            sources=["upload", "clipboard"], height=200,
         )
+        last_image = gr.Image(
+            label="Last keyframe (optional)", type="filepath",
+            sources=["upload", "clipboard"], height=200,
+        )
+    canvas = gr.Dropdown(choices=canvases, value=default_canvas, label="Canvas")
+    duration = gr.Slider(
+        low, high, default_duration, step=0.5,
+        label="Duration (seconds)",
+        info=f"Snapped up to the next decodable frame count. {high:g} s is the maximum.",
+    )
+    lora = gr.Dropdown(
+        choices=[(f"{name} ({steps} steps)", name) for name, steps in loras.items()],
+        value=default_lora, label="Turbo LoRA",
+    )
+    steps = gr.Slider(
+        cfg.get("min_steps", 2), cfg.get("max_steps", 40), default_steps,
+        step=1, label="Sampling steps",
+    )
+    upsample = gr.Checkbox(
+        label="Let the remote conditioner rewrite the prompt",
+        value=bool(cfg.get("default_upsample", False)),
+    )
+    cost = gr.Textbox(
+        label="This request",
+        value=describe_remote_request(default_canvas, default_duration, default_steps, 0),
+        interactive=False, lines=2,
+    )
+
+    # Picking a LoRA moves the step count to the one it was distilled for; the
+    # slider stays free afterwards, because `off` at 6 steps is a legitimate
+    # (if ugly) thing to try.
+    lora.change(fn=lambda name: loras.get(name, gr.update()), inputs=[lora], outputs=[steps])
+
+    priced = [canvas, duration, steps, first_image, last_image]
+    for control in priced:
+        control.change(
+            fn=lambda c, d, s, a, b: describe_remote_request(
+                c, d, s, int(bool(a)) + int(bool(b))
+            ),
+            inputs=priced,
+            outputs=[cost],
+        )
+
+    return {
+        "first_image": first_image, "last_image": last_image, "canvas": canvas,
+        "duration": duration, "steps": steps, "lora": lora, "upsample": upsample,
+        "cost": cost,
+    }
+
+
+def create_video_tab(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    remote_cfg = cfg.get("remote_engine") or {}
+    remote_on = bool(remote_cfg.get("enabled")) and bool(remote_cfg.get("space_id"))
+
+    with gr.TabItem("Video"):
+        if remote_on:
+            gr.Markdown(
+                "Two engines. **LTX-Video** is local — fast, silent, every "
+                "resolution. **MiniMax-H3** runs on another Space and returns "
+                "video with a matching soundtrack, up to "
+                f"{remote_cfg.get('max_duration', 14):g} seconds."
+            )
+        else:
+            gr.Markdown(
+                f"**{cfg['model_id']}** · text-to-video and image-to-video. "
+                f"Resolution snaps to multiples of {cfg.get('size_step', 32)}, "
+                f"frame count to 8n+1. Attach an image to drive image-to-video."
+            )
         with gr.Row():
             with gr.Column(scale=1):
-                prompt = gr.Textbox(label="Prompt", lines=4, placeholder="Describe the scene and its motion…")
-                negative = gr.Textbox(
-                    label="Negative prompt", lines=2,
-                    value=cfg.get("default_negative_prompt", ""),
+                engine = (
+                    gr.Radio(
+                        choices=[
+                            ("LTX-Video · local, no audio", ENGINE_LTX),
+                            (remote_cfg.get("label") or "MiniMax-H3 · remote", ENGINE_H3),
+                        ],
+                        value=ENGINE_LTX,
+                        label="Engine",
+                    )
+                    if remote_on
+                    else gr.State(ENGINE_LTX)
                 )
-                image = gr.Image(
-                    label="Conditioning image (optional)", type="pil",
-                    sources=["upload", "clipboard"], height=220,
+                prompt = gr.Textbox(
+                    label="Prompt", lines=4,
+                    placeholder="Describe the scene and its motion…",
                 )
-                with gr.Accordion("Parameters", open=True):
-                    width = gr.Slider(
-                        cfg.get("min_size", 320), cfg.get("max_size", 1216),
-                        cfg["default_width"], step=cfg.get("size_step", 32), label="Width",
+
+                with gr.Group(visible=True) as ltx_group:
+                    negative = gr.Textbox(
+                        label="Negative prompt", lines=2,
+                        value=cfg.get("default_negative_prompt", ""),
                     )
-                    height = gr.Slider(
-                        cfg.get("min_size", 320), cfg.get("max_size", 1216),
-                        cfg["default_height"], step=cfg.get("size_step", 32), label="Height",
+                    image = gr.Image(
+                        label="Conditioning image (optional)", type="pil",
+                        sources=["upload", "clipboard"], height=220,
                     )
-                    frames = gr.Slider(
-                        cfg["min_frames"], cfg["max_frames"], cfg["default_frames"],
-                        step=8, label="Frames",
-                    )
-                    fps = gr.Slider(
-                        cfg["min_fps"], cfg["max_fps"], cfg["default_fps"],
-                        step=1, label="Playback FPS",
-                    )
-                    steps = gr.Slider(
-                        cfg["min_steps"], cfg["max_steps"], cfg["default_steps"],
-                        step=1, label="Steps",
-                    )
-                    guidance = gr.Slider(
-                        cfg.get("min_guidance", 1.0), cfg.get("max_guidance", 10.0),
-                        cfg.get("default_guidance", 3.0), step=0.1, label="Guidance scale",
-                    )
-                    seed, randomize = _seed_row()
-                button = gr.Button("Generate video", variant="primary")
+                    with gr.Accordion("Parameters", open=True):
+                        width = gr.Slider(
+                            cfg.get("min_size", 320), cfg.get("max_size", 1216),
+                            cfg["default_width"], step=cfg.get("size_step", 32),
+                            label="Width",
+                        )
+                        height = gr.Slider(
+                            cfg.get("min_size", 320), cfg.get("max_size", 1216),
+                            cfg["default_height"], step=cfg.get("size_step", 32),
+                            label="Height",
+                        )
+                        frames = gr.Slider(
+                            cfg["min_frames"], cfg["max_frames"], cfg["default_frames"],
+                            step=8, label="Frames",
+                        )
+                        fps = gr.Slider(
+                            cfg["min_fps"], cfg["max_fps"], cfg["default_fps"],
+                            step=1, label="Playback FPS",
+                        )
+                        steps = gr.Slider(
+                            cfg["min_steps"], cfg["max_steps"], cfg["default_steps"],
+                            step=1, label="Steps",
+                        )
+                        guidance = gr.Slider(
+                            cfg.get("min_guidance", 1.0), cfg.get("max_guidance", 10.0),
+                            cfg.get("default_guidance", 3.0), step=0.1,
+                            label="Guidance scale",
+                        )
+
+                remote: Dict[str, Any] = {}
+                with gr.Group(visible=False) as h3_group:
+                    if remote_on:
+                        remote = _remote_video_group(remote_cfg)
+
+                seed, randomize = _seed_row()
+                ltx_button = gr.Button("Generate video", variant="primary")
+                h3_button = gr.Button(
+                    "Generate video + audio", variant="primary", visible=False
+                )
             with gr.Column(scale=1):
                 output = gr.Video(label="Result", height=520)
-                info = gr.Textbox(label="Run info", interactive=False, lines=2)
-    return {
-        "prompt": prompt, "negative": negative, "image": image, "width": width,
-        "height": height, "frames": frames, "fps": fps, "steps": steps,
-        "guidance": guidance, "seed": seed, "randomize": randomize,
-        "button": button, "output": output, "info": info,
+                info = gr.Textbox(label="Run info", interactive=False, lines=3)
+
+        if remote_on:
+            # One button per engine rather than one that branches: the two
+            # events need different concurrency. A remote render holds no local
+            # GPU and takes minutes, so serialising it behind the local queue
+            # would freeze every other tab for the duration.
+            engine.change(
+                fn=toggle_video_engine,
+                inputs=[engine],
+                outputs=[ltx_group, h3_group, ltx_button, h3_button],
+            )
+
+    built = {
+        "engine": engine, "prompt": prompt, "negative": negative, "image": image,
+        "width": width, "height": height, "frames": frames, "fps": fps,
+        "steps": steps, "guidance": guidance, "seed": seed, "randomize": randomize,
+        "button": ltx_button, "h3_button": h3_button, "output": output, "info": info,
+        "ltx_group": ltx_group, "h3_group": h3_group, "remote_enabled": remote_on,
     }
+    built.update({f"h3_{key}": value for key, value in remote.items()})
+    return built
+
+
+def toggle_video_engine(engine: str) -> tuple[Any, Any, Any, Any]:
+    """Show the controls and the button belonging to the selected engine."""
+    local = engine != ENGINE_H3
+    return (
+        gr.update(visible=local),
+        gr.update(visible=not local),
+        gr.update(visible=local),
+        gr.update(visible=not local),
+    )
 
 
 def create_text_tab(cfg: Dict[str, Any]) -> Dict[str, Any]:

@@ -32,6 +32,13 @@ spaces>=0.51,<1
 
 gradio==6.26.0
 
+# `gradio_client` — used by the Video tab's remote MiniMax-H3 engine — is
+# deliberately NOT pinned here. gradio pins it exactly (6.26.0 requires
+# gradio-client==2.6.1), so any pin of our own either duplicates that or
+# contradicts it, and pip reports the contradiction as a conflict in gradio.
+# If it is ever missing, the install is broken rather than under-specified;
+# `pipeline/remote.py` says so in the ImportError it raises.
+
 # Chroma and LTX both use a sentencepiece-backed T5 tokenizer, which fails to
 # load without these two. The original requirements omitted them.
 sentencepiece>=0.2,<1

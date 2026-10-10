@@ -30,6 +30,7 @@ import gradio as gr
 import ui_components as ui
 from pipeline.config import ConfigError, load_config
 from pipeline.models import GenerationError, ModelLoadError, ModelManager
+from pipeline.remote import RemoteEngineError, RemoteVideoEngine
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -40,6 +41,12 @@ LOGGER = logging.getLogger("app")
 CONFIG_PATH = os.environ.get("PIPELINE_CONFIG", "config.json")
 CONFIG = load_config(CONFIG_PATH)
 MANAGER = ModelManager(CONFIG)
+
+# MiniMax-H3, on another Space. Constructed unconditionally — it holds nothing
+# but config until a request is made, and `enabled` is what gates it.
+REMOTE_VIDEO = RemoteVideoEngine(
+    CONFIG.video_remote, output_dir=CONFIG.system.get("output_dir", "outputs")
+)
 
 MAX_PROMPT_CHARS = int(CONFIG.system.get("max_prompt_chars", 4000))
 SEED_MAX = 2**31 - 1
@@ -91,7 +98,7 @@ def _fail(exc: Exception) -> "gr.Error":
     """
     if isinstance(exc, gr.Error):
         return exc
-    if isinstance(exc, (ModelLoadError, GenerationError)):
+    if isinstance(exc, (ModelLoadError, GenerationError, RemoteEngineError)):
         return gr.Error(str(exc))
     LOGGER.error("request failed", exc_info=exc)
     return gr.Error(f"{type(exc).__name__}: {exc}")
@@ -270,6 +277,102 @@ def handle_video(
     return path, _run_info("video", seed, duration, path), *_status()
 
 
+def handle_video_remote(
+    prompt, first_image, last_image, canvas, duration, steps, lora, upsample,
+    seed, randomize, request: gr.Request = None, progress=gr.Progress(),
+):
+    """MiniMax-H3, on another Space. No local model and no local GPU.
+
+    Note what is *not* here: no `MANAGER.ensure_loaded`, and no `@spaces.GPU`
+    wrapper. Nothing is downloaded and no card is booked on this side, which is
+    the whole point — this Space's disk and its dependency pins are untouched.
+
+    `request` is what makes the quota land on the right account. ZeroGPU bills
+    a booking to whatever the `x-ip-token` header identifies, and this handler
+    is the only place that header is readable; see `RemoteVideoEngine._predict`
+    for what happens when it is not forwarded.
+    """
+    prompt = _clean_prompt(prompt)
+    seed = _resolve_seed(seed, randomize)
+    ip_token = None
+    if request is not None:
+        try:
+            ip_token = request.headers.get("x-ip-token")
+        except AttributeError:  # pragma: no cover - a Request always has headers
+            ip_token = None
+    if not ip_token:
+        LOGGER.warning(
+            "no x-ip-token on this request: %s will book against its own pod "
+            "quota, not the caller's",
+            REMOTE_VIDEO.space_id,
+        )
+
+    keyframes = int(bool(first_image)) + int(bool(last_image))
+    eta = REMOTE_VIDEO.estimate(canvas, duration, steps, keyframes)
+    try:
+        progress(
+            0.1,
+            desc=f"Sending to {REMOTE_VIDEO.space_id} (~{eta}s of GPU there)…",
+        )
+        path, report, refined, elapsed = REMOTE_VIDEO.generate(
+            prompt=prompt,
+            image=first_image,
+            last_image=last_image,
+            canvas=canvas,
+            duration=float(duration),
+            steps=int(steps),
+            seed=seed,
+            upsample=bool(upsample),
+            lora=str(lora),
+            ip_token=ip_token,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _fail(exc) from exc
+
+    MANAGER.log_external_run(
+        kind="video",
+        prompt=prompt,
+        params={
+            "engine": "minimax_h3",
+            "space_id": REMOTE_VIDEO.space_id,
+            "canvas": canvas,
+            "duration_requested": float(duration),
+            "steps": int(steps),
+            "lora": str(lora),
+            "upsample": bool(upsample),
+            "seed": int(seed),
+            "keyframes": keyframes,
+            "attributed": bool(ip_token),
+        },
+        duration=elapsed,
+        out_path=path,
+        model_id=REMOTE_VIDEO.space_id,
+    )
+    progress(1.0, desc="Done")
+    return path, _remote_run_info(seed, elapsed, path, report, refined), *_status()
+
+
+def _remote_run_info(
+    seed: int, elapsed: float, path: str, report: str, refined: str
+) -> str:
+    """Our line, then the remote Space's own report verbatim.
+
+    Its report carries what only it can know — the resolved canvas, the token
+    count, the measured seconds per step, which LoRA was folded in — and
+    reprinting it is strictly better than paraphrasing numbers we did not
+    measure.
+    """
+    lines = [
+        f"video (MiniMax-H3) · seed {seed} · {elapsed:.1f}s round trip · "
+        f"saved {os.path.basename(path)}"
+    ]
+    if report:
+        lines.append(f"remote: {report}")
+    if refined:
+        lines.append(f"prompt rewritten to: {refined}")
+    return "\n".join(lines)
+
+
 CONTINUATION_TEMPLATE = (
     "Here is the beginning of your previous answer, which was cut off before "
     "it finished:\n\n---\n{previous}\n---\n\nContinue from exactly where it "
@@ -367,7 +470,15 @@ def handle_unload() -> tuple[str, str, str]:
 
 
 def handle_refresh_status() -> tuple[str, str, str]:
+    """The one place the remote Space is probed.
+
+    Deliberately not in `_status()`, which runs after every generation: a
+    network round trip there would add its latency and its failure modes to
+    every local render. Here a person pressed a button and is waiting.
+    """
     notices = MANAGER.take_notices()
+    if REMOTE_VIDEO.enabled:
+        notices.append(REMOTE_VIDEO.status())
     return ("\n".join(notices) or "Status refreshed."), *_status()
 
 
@@ -393,11 +504,20 @@ def build_ui() -> gr.Blocks:
         "default text model) will fall back to their open alternative."
     )
 
+    remote_note = (
+        f"\n\nThe Video tab can also render on **{REMOTE_VIDEO.space_id}** "
+        f"(MiniMax-H3, video with a synchronised soundtrack). That runs on a "
+        f"separate Space — nothing of it is downloaded here — and books its GPU "
+        f"against your own quota."
+        if REMOTE_VIDEO.enabled
+        else ""
+    )
+
     with gr.Blocks(title="AI Media Pipeline") as demo:
         gr.Markdown(
             "# AI Media Pipeline\n"
-            "Image · Video · Vision-language text, one model resident at a time.\n\n"
-            f"{banner}{token_note}"
+            "Photo · Video · Vision-language text, one model resident at a time.\n\n"
+            f"{banner}{token_note}{remote_note}"
         )
         model_status, runtime_status = ui.status_row()
         status_targets = [model_status, runtime_status]
@@ -406,7 +526,7 @@ def build_ui() -> gr.Blocks:
             image_ui = (
                 ui.create_image_tab(CONFIG.image)
                 if CONFIG.is_enabled("image")
-                else ui.disabled_tab("Image", "image")
+                else ui.disabled_tab("Photo", "image")
             )
             video_ui = (
                 ui.create_video_tab(CONFIG.video)
@@ -443,6 +563,27 @@ def build_ui() -> gr.Blocks:
                 ],
                 outputs=[video_ui["output"], video_ui["info"], *status_targets],
             )
+            if video_ui.get("remote_enabled"):
+                # Its own concurrency lane. The default limit of 1 exists
+                # because only one model may be resident on the local GPU; a
+                # remote render holds neither, and letting a six-minute network
+                # call sit in that queue would block every image and text
+                # request behind it.
+                video_ui["h3_button"].click(
+                    fn=handle_video_remote,
+                    inputs=[
+                        video_ui["prompt"], video_ui["h3_first_image"],
+                        video_ui["h3_last_image"], video_ui["h3_canvas"],
+                        video_ui["h3_duration"], video_ui["h3_steps"],
+                        video_ui["h3_lora"], video_ui["h3_upsample"],
+                        video_ui["seed"], video_ui["randomize"],
+                    ],
+                    outputs=[video_ui["output"], video_ui["info"], *status_targets],
+                    concurrency_id="remote_video",
+                    concurrency_limit=int(
+                        CONFIG.video_remote.get("concurrency_limit", 2)
+                    ),
+                )
         if text_ui:
             # The only state the Text tab keeps: the last answer, so
             # "Continue last answer" has something to continue.

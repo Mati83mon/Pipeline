@@ -809,3 +809,198 @@ the handlers into generators and moving a live stream across the ZeroGPU worker
 boundary — the same boundary that, three findings ago, could not carry an
 exception message. That is its own change with its own failure modes, and
 bolting it onto this one would put both at risk.
+
+---
+
+## G. Adding video with audio (MiniMax-H3)
+
+The request was to add the model behind
+[`Pepe104/MiniMax-H3-Turbo-Lora-UNCENSORED`](https://huggingface.co/spaces/Pepe104/MiniMax-H3-Turbo-Lora-UNCENSORED)
+to the Video tab: joint video and soundtrack from one denoising pass, with
+clips longer than the 5 s the operator had been getting, and without the
+existing Space "suffering".
+
+That last constraint turned out to decide the whole design, because the
+obvious implementation — a fourth model in `ModelManager` — is not possible.
+Three findings, each read off primary sources rather than inferred.
+
+### G1. The checkpoint does not fit, and neither does half of it
+
+`MiniMaxAI/MiniMax-H3` is 33.1B parameters, 195.9 GiB in bfloat16. A ZeroGPU
+Space is evicted at **150 GB of storage**. There is no unquantized single-Space
+deployment of this model and there cannot be; upstream splits it in two and
+documents why, including the exact failure:
+
+```
+ZeroGPU tensors packing:   0%|          | 0.00/77.3G
+OSError: [Errno 28] No space left on device      # os.posix_fallocate
+```
+
+`spaces`' startup `torch.pack()` writes a second on-disk copy of every
+startup-resident CUDA tensor before deleting the originals, so packing 77.3 GB
+needs 154.6 GB at once.
+
+| | GB |
+|---|---|
+| Denoiser half (`transformer/` + `vae/` + `audio_vae/`) | 77.3 |
+| Conditioner half (`text_encoder/` + `tokenizer/` + `processor/`) | 66.7 |
+| This Space today (Chroma 28 + LTX 27 + Qwen3.8 31) | ~86 |
+
+77.3 + 86 = 163 GB. The *half* does not fit beside what is already here, and
+the disk guard would be re-downloading tens of gigabytes on every tab switch
+even if it did.
+
+### G2. The dependency sets are mutually exclusive
+
+This is the finding that closes the door, and it closes it on the back of E7
+— the defect this project spent the longest on. From the remote Space's own
+`requirements.txt`, verbatim:
+
+> `# No kernels pin on purpose: the Hub attention backends want kernels>=0.12.3, and that version breaks transformers 5.8.0 at import.`
+
+| | MiniMax-H3 | this Space |
+|---|---|---|
+| `transformers` | `==5.8.0` | `==5.16.1` |
+| `kernels` | unpinned; ≥0.12.3 breaks its import | `>=0.16,<0.17`, **required** by the FP8 27B text model (E7) |
+| `diffusers` | unmerged PR commit `665f5782` ([#14371](https://github.com/huggingface/diffusers/pull/14371)) | `==0.40.0` release, which Chroma and LTX need |
+| `gradio` | `==6.20.0` | `==6.26.0` |
+
+Install their set and the Text tab dies on the first forward pass with exactly
+the `ImportError: finegrained-fp8 kernel unavailable` of E7. Install ours and
+MiniMax-H3 cannot import. The `diffusers` row is independently fatal: a WIP
+pull request against a released pin that two working pipelines depend on.
+
+It also wants `size="xlarge"` — upstream says `large` does not fit — where
+this Space runs `large` and an xlarge second costs 2× quota.
+
+**Fixed by** not loading it. `pipeline/remote.py` calls the remote Space's
+`/generate` over `gradio_client`; `requirements.txt` gains no package, the disk
+gains no byte, and no local GPU is booked. A test asserts the last part from
+the module's parse tree rather than its text, because the module explains the
+rule in prose and a substring search cannot tell the explanation from the
+mistake.
+
+### G3. Quota attribution is the failure mode that looks like a hang
+
+ZeroGPU bills a booking to whatever the `x-ip-token` header identifies. A
+server-to-server `gradio_client` call carries no such header by default, so
+both bookings — the denoiser's *and* its conditioner's — land on the remote
+Space's pod IP and its shared quota, where an unattributed caller may hold at
+most 120 credits and an `xlarge` second costs two of them.
+
+A render of any useful length needs several hundred seconds. It does not fit in
+that ceiling, so the symptom is not a larger bill: it is a request that queues
+for an allocation it can never be granted. From the UI that is indistinguishable
+from a hung Space.
+
+The remote Space hits the identical problem calling its own conditioner, and
+its code says why the obvious fix does not work:
+
+> `LocalContext`-based token forwarding is not reliable in Server mode, so the `x-ip-token` header is extracted from the incoming request and passed explicitly
+
+**Fixed by** taking `request: gr.Request` in `handle_video_remote` and
+forwarding the header on the `predict` call. A test asserts it is sent when
+present and absent when not; dropping the forwarding fails that test.
+
+### G4. Sending `HF_TOKEN` to a Space we do not own would leak it
+
+`gradio_client.Client` accepts a token, and the reflex is to pass `HF_TOKEN`
+because every other `from_pretrained` call in this project does. Here it is a
+credential leak: the default `space_id` belongs to someone else, our token is a
+read credential for a gated model, and the default target is public and needs
+no credential at all.
+
+**Fixed by** defaulting to no token, with `video.remote_engine.send_hf_token`
+to opt in per Space for a private duplicate of one's own. A test sets `HF_TOKEN`
+in the environment and asserts it does not reach the client — and that it does
+when the flag is set.
+
+### G5. A six-minute network call in a queue sized for one resident model
+
+`demo.queue(default_concurrency_limit=1)` is correct for the local tabs: only
+one model may be resident on the GPU. It is wrong for a remote render, which
+holds neither the GPU nor a model and takes minutes. In the shared lane, one
+MiniMax request freezes every image and text generation for its whole duration.
+
+**Fixed by** giving the remote event its own `concurrency_id` and limit. This
+is why the tab has two buttons rather than one that branches — concurrency is
+per event, so a single handler could not have both policies.
+
+### G6. 14 seconds is the ceiling, and a 15 s slider would be a trap
+
+The operator asked for the longest clips possible. The answer is **14 s**, and
+it is the checkpoint's limit rather than a UI preference.
+
+At 24 fps the video VAE decodes `17n + 5` frames only, so a request is snapped
+*up* to the next such count. 15 s is 360 frames, which snaps to 362 — 15.083 s
+— past the duration the pipeline accepts, and the request is refused outright.
+14 s snaps to 345 frames, 14.375 s, and lands.
+
+```
+     13 s ->  328 frames = 13.667 s  ok
+   13.5 s ->  328 frames = 13.667 s  ok
+     14 s ->  345 frames = 14.375 s  ok      <- the longest request that works
+   14.5 s ->  362 frames = 15.083 s  refused
+     15 s ->  362 frames = 15.083 s  refused
+```
+
+A slider reaching 15 would have offered a guaranteed failure as its headline
+feature. It stops at 14, and `snap_frames` is reimplemented here — not
+approximated — so the UI can state the duration that will actually come back.
+The same table shows why 13 and 13.5 are indistinguishable: the snapping step
+is 17/24 = 0.708 s, so adjacent slider positions collapse onto one frame count.
+
+### G7. Cost is quadratic in the canvas, and nothing said so
+
+The remote `get_duration` is quadratic in the packed row count, because
+MiniMax-H3 attends over the whole sequence in every layer. The consequence is
+not intuitive from the controls:
+
+| Request | GPU booked | At xlarge |
+|---|---|---|
+| 5 s, 960x544, 6 steps | ~73 s | ~146 s of quota |
+| 10 s, 768x1344, 1 keyframe, 6 steps | ~271 s | ~542 s |
+| 14 s, 1344x768, 1 keyframe, 6 steps | ~440 s | ~880 s |
+| 10 s, 1536x672, no LoRA (28 steps) | ~900 s | ~1800 s |
+
+Against a free tier of 5 minutes a day and PRO's 40, the difference between the
+first and last row is the difference between a day's worth of renders and one.
+
+**Fixed by** porting `get_duration` into `estimate_gpu_seconds` and printing it
+live in a **This request** box that updates on every control change, before the
+click. The port is the kind of thing that goes silently wrong, so the test
+suite carries an independent transcription of the upstream formula and compares
+the two across 720 parameter combinations; changing one coefficient in either
+copy fails it.
+
+### G8. A remote render would have been the one output History never saw
+
+`gradio_client` downloads the result into a temp directory it manages. Nothing
+else in this project knows that directory, so the file would never appear in
+the History tab and `prune_directory` would never count it against
+`keep_outputs` — the cap would quietly stop holding.
+
+**Fixed by** `_adopt`, which moves the file into this Space's own output
+directory under the usual naming, and `ModelManager.log_external_run`, which
+records a run that had no `LoadedModel` to hand `_finish`.
+
+### Not done, deliberately
+
+**An Audio tab.** Asked for, and explicitly deferred to its own change. Worth
+noting what it is *not*: MiniMax-H3 already returns a muxed soundtrack, so the
+Audio tab is for something else — speech, music, or sound effects on their own
+— and that is a model choice, not a wiring job.
+
+**Our own conditioner copy.** The remote denoiser calls
+`multimodalart/qwen3vl-conditioner`, a third Space, 66.7 GB. Duplicating it
+removes the last dependency on someone else's uptime and costs a third Space;
+README says how. Left to the operator because it is a hosting decision.
+
+**Reading the remote canvas table at startup.** The labels are matched by
+string on the far side, so a renamed canvas upstream breaks every render with
+an error raised by a Space the user has never heard of. The obvious guard — ask
+`/studio-config` when building the dropdown — puts a network call on the UI
+build path, where a remote Space mid-load would add seconds to *every* start of
+this one, including the starts where nobody opens the tab. The check is in
+`check_remote_canvases()` instead, reached from **Refresh status**, where a
+person pressed a button and is waiting.
