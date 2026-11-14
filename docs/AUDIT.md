@@ -1004,3 +1004,14 @@ build path, where a remote Space mid-load would add seconds to *every* start of
 this one, including the starts where nobody opens the tab. The check is in
 `check_remote_canvases()` instead, reached from **Refresh status**, where a
 person pressed a button and is waiting.
+
+### G9. The upstream Space disappeared
+
+By November 2026 `Pepe104/MiniMax-H3-Turbo-Lora-UNCENSORED` reported `stage: PAUSED` and `disabled: true`
+on the Hub API, so every remote render failed. `video.remote_engine.space_id` now points at
+`baka999/MiniMax-H3-Turbo-Lora-UNCENSORED`, a separately maintained copy of the same app that is running.
+Its `/generate` endpoint keeps every parameter this client sends, under the same names, and adds only
+parameters with defaults (`mode`, `reference_*`, `custom_loras`), so no client change was needed. It
+still calls `multimodalart/qwen3vl-conditioner` for prompt encoding. Section G1–G8 still describe the
+design; this changes only which third-party Space it depends on, and that dependency remains the risk
+recorded above.

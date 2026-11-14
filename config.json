@@ -61,7 +61,7 @@
       "$comment": "MiniMax-H3: video WITH a synchronised soundtrack from one denoising pass, run on another Space over its Gradio API rather than loaded here. Three reasons it cannot be local, none fixable with pins: (1) the checkpoint is 195.9 GiB bf16 against a ZeroGPU Space's 150 GB storage ceiling, so upstream splits it into a 77.3 GB denoiser and a 66.7 GB Qwen3-VL conditioner - this Space already carries ~86 GB; (2) the denoiser pins transformers==5.8.0 and its own requirements record that the kernels release FP8 attention needs 'breaks transformers 5.8.0 at import', while our 27B FP8 text model REQUIRES kernels>=0.16 (see docs/AUDIT.md E7); (3) it needs size=xlarge, which upstream says large cannot replace. See docs/AUDIT.md section G and pipeline/remote.py.",
       "enabled": true,
       "label": "MiniMax-H3 (uncensored) - video + synchronised audio",
-      "space_id": "Pepe104/MiniMax-H3-Turbo-Lora-UNCENSORED",
+      "space_id": "baka999/MiniMax-H3-Turbo-Lora-UNCENSORED",
       "api_name": "/generate",
       "$comment_space_id": "Defaults to the upstream Space so the tab works out of the box. Point this at your OWN duplicate for reliability: the default is someone else's queue and can change or go private without notice. Duplicating needs no secrets - every weight it downloads is public.",
       "send_hf_token": false,

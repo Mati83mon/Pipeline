@@ -125,7 +125,8 @@ It works out of the box against the upstream Space. For anything you rely on,
 point it at your own copy instead — the default is someone else's queue and can
 change or go private without notice:
 
-1. **Duplicate** [`Pepe104/MiniMax-H3-Turbo-Lora-UNCENSORED`](https://huggingface.co/spaces/Pepe104/MiniMax-H3-Turbo-Lora-UNCENSORED).
+1. **Duplicate** [`baka999/MiniMax-H3-Turbo-Lora-UNCENSORED`](https://huggingface.co/spaces/baka999/MiniMax-H3-Turbo-Lora-UNCENSORED)
+   (the original `Pepe104/...` Space this was first wired to is now paused and disabled).
    No secrets are needed; every weight it downloads is public.
 2. Set its hardware to **ZeroGPU** and its `H3_GPU_SIZE` variable to `xlarge`.
 3. Put `owner/name` in `video.remote_engine.space_id` here.
